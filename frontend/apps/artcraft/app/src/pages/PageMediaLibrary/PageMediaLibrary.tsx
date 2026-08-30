@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { faFolderOpen } from "@fortawesome/pro-solid-svg-icons";
+import { faFolderOpen } from "@fortawesome/free-solid-svg-icons";
 import { Button } from "@storyteller/ui-button";
 import {
   EagleImportWizard,

@@ -6,15 +6,15 @@ import {
   faMusic,
   faDroplet,
   faPhotoFilm,
+  faPhotoVideo,
   faGlobe,
   faPencil,
   faWandMagicSparkles,
   faPenNib,
   faCrosshairs,
-  faSparkles,
+  faStar,
   faObjectGroup,
-  faPhotoFilmMusic,
-} from "@fortawesome/pro-solid-svg-icons";
+} from "@fortawesome/free-solid-svg-icons";
 import { useMemo } from "react";
 import {
   useExperimentalStore,
@@ -334,7 +334,7 @@ export const ALL_APPS: FullAppItem[] = [
     id: "background-change",
     label: "Background Change",
     description: "Swap the backdrop of a video using a reference image",
-    icon: faSparkles,
+    icon: faStar,
     category: "edit",
     action: "BACKGROUND_CHANGE",
     color: "bg-orange-500/40",
@@ -372,7 +372,7 @@ export const ALL_APPS: FullAppItem[] = [
     id: "media-library",
     label: "Media Library",
     description: "Search and browse everything you've generated",
-    icon: faPhotoFilmMusic,
+    icon: faPhotoVideo,
     category: "edit",
     action: "MEDIA_LIBRARY",
     color: "bg-teal-600/40",

@@ -212,7 +212,7 @@ pub async fn handle_generate_image(
   arguments: Option<Value>,
 ) -> Result<CallToolResult> {
   let args = arguments.ok_or_else(|| anyhow!("Arguments are required"))?;
-  
+
   let prompt = args.get("prompt")
     .and_then(|v| v.as_str())
     .ok_or_else(|| anyhow!("Missing required parameter: prompt"))?
@@ -346,10 +346,12 @@ pub async fn handle_generate_video(
     reference_character_tokens: None,
     resolution: None,
     aspect_ratio: None,
+    bitrate: None,
     quality: None,
     duration_seconds: duration,
     video_batch_count: None,
     generate_audio: None,
+    estimate_only: None,
   };
 
   info!("Sending video generation request to omni endpoint...");
@@ -425,9 +427,9 @@ pub async fn handle_create_checkout_session(
   arguments: Option<Value>,
 ) -> Result<CallToolResult> {
   let args = arguments.ok_or_else(|| anyhow!("Arguments are required"))?;
-  
+
   let checkout_type = args.get("type").and_then(|v| v.as_str()).unwrap_or("");
-  
+
   let text = if checkout_type == "credits" {
     let pack: Option<ArtcraftCreditsPackSlug> = args.get("pack_slug").and_then(|v| serde_json::from_value(v.clone()).ok());
     let request = StripeArtcraftCreateCreditsPackCheckoutRequest { credits_pack: pack };
@@ -459,7 +461,7 @@ pub async fn handle_get_billing_portal_url(
   let request = StripeArtcraftCustomerPortalManagePlanRequest { portal_config_id: None };
   let response = customer_portal_manage_plan(api_host, Some(creds), request).await
     .map_err(|e| anyhow!("Failed to create customer portal session: {:?}", e))?;
-  
+
   let text = format!("Generated Stripe Customer Portal URL:\n{}", response.stripe_portal_url);
   Ok(CallToolResult {
     content: vec![McpContent::Text { text }],
@@ -473,13 +475,13 @@ pub async fn handle_estimate_image_cost(
   arguments: Option<Value>,
 ) -> Result<CallToolResult> {
   let args = arguments.ok_or_else(|| anyhow!("Arguments are required"))?;
-  
+
   let model: CommonImageModel = serde_json::from_value(args.get("model").unwrap_or(&Value::Null).clone())
     .map_err(|e| anyhow!("Invalid model: {:?}", e))?;
-  
+
   let provider: GenerationProvider = serde_json::from_value(args.get("provider").unwrap_or(&Value::Null).clone())
     .map_err(|e| anyhow!("Invalid provider: {:?}", e))?;
-  
+
   let mode_str = args.get("generation_mode").and_then(|v| v.as_str()).unwrap_or("");
   let generation_mode = if mode_str == "text_to_image" {
     ImageGenMode::TextToImage
@@ -518,13 +520,13 @@ pub async fn handle_estimate_video_cost(
   arguments: Option<Value>,
 ) -> Result<CallToolResult> {
   let args = arguments.ok_or_else(|| anyhow!("Arguments are required"))?;
-  
+
   let model: CommonVideoModel = serde_json::from_value(args.get("model").unwrap_or(&Value::Null).clone())
     .map_err(|e| anyhow!("Invalid model: {:?}", e))?;
-  
+
   let provider: GenerationProvider = serde_json::from_value(args.get("provider").unwrap_or(&Value::Null).clone())
     .map_err(|e| anyhow!("Invalid provider: {:?}", e))?;
-  
+
   let mode_str = args.get("generation_mode").and_then(|v| v.as_str()).unwrap_or("");
   let generation_mode = if mode_str == "text_to_video" {
     VideoGenMode::TextToVideo
@@ -564,7 +566,7 @@ pub async fn handle_get_media_file(
 ) -> Result<CallToolResult> {
   let token_str = arguments.and_then(|v| v.get("media_token").and_then(|t| t.as_str()).map(|s| s.to_string()))
     .ok_or_else(|| anyhow!("Missing media_token"))?;
-  
+
   let token = MediaFileToken::new_from_str(&token_str);
   let response = get_media_file(api_host, &token).await
     .map_err(|e| anyhow!("Failed to get media file: {:?}", e))?;
@@ -584,7 +586,7 @@ pub async fn handle_download_media_file(
   let args = arguments.ok_or_else(|| anyhow!("Arguments are required"))?;
   let token_str = args.get("media_token").and_then(|t| t.as_str()).ok_or_else(|| anyhow!("Missing media_token"))?;
   let dir_str = args.get("download_directory").and_then(|t| t.as_str()).ok_or_else(|| anyhow!("Missing download_directory"))?;
-  
+
   let token = MediaFileToken::new_from_str(token_str);
   let dl_args = DownloadMediaFileArgs {
     media_token: &token,
@@ -609,7 +611,7 @@ pub async fn handle_delete_media_file(
 ) -> Result<CallToolResult> {
   let token_str = arguments.and_then(|v| v.get("media_token").and_then(|t| t.as_str()).map(|s| s.to_string()))
     .ok_or_else(|| anyhow!("Missing media_token"))?;
-  
+
   let token = MediaFileToken::new_from_str(&token_str);
   delete_media_file(api_host, Some(creds), &token).await
     .map_err(|e| anyhow!("Failed to delete media file: {:?}", e))?;
@@ -678,7 +680,7 @@ pub async fn handle_check_provider_credentials(
   home.push("credentials");
 
   let mut text = "Provider Credentials Status:\n\n".to_string();
-  
+
   let providers = vec![
     ("FAL API Key", "fal.api_key.txt"),
     ("Midjourney Login", "midjourney.web_login.toml"),

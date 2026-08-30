@@ -25,11 +25,11 @@ use uuid::uuid;
 pub struct UploadImageBytesArgs<'a> {
   pub api_host: &'a ApiHost,
   pub maybe_creds: Option<&'a StorytellerCredentialSet>,
-  
+
   // NB: Bytes need to be owned for the request.
   pub image_bytes: Vec<u8>,
   pub image_type: ImageType,
-  
+
   /// If true, we should hide the image from the user's gallery.
   pub is_intermediate_system_file: bool,
 
@@ -85,7 +85,7 @@ pub async fn upload_image_media_file_from_bytes(
   let mut form = Form::new()
       .text("uuid_idempotency_token", generate_random_uuid())
       .part("file", part);
-  
+
   if args.is_intermediate_system_file {
     form = form.text("is_intermediate_system_file", "true");
   }
@@ -97,13 +97,11 @@ pub async fn upload_image_media_file_from_bytes(
   let mut request_builder = client.post(url)
       .header("User-Agent", USER_AGENT)
       .header("Accept", APPLICATION_JSON);
-  
+
   if let Some(creds) = args.maybe_creds {
-    if let Some(header) = &creds.maybe_as_cookie_header() {
-      request_builder = request_builder.header("Cookie", header);
-    }
+    request_builder = creds.apply_auth(request_builder);
   }
-  
+
   let response = request_builder
       .multipart(form)
       .send()

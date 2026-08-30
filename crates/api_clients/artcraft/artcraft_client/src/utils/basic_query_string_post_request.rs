@@ -36,9 +36,7 @@ pub async fn basic_query_string_post_request<Res: DeserializeOwned>(
       .header("Accept", APPLICATION_JSON);
 
   if let Some(creds) = maybe_creds {
-    if let Some(header) = &creds.maybe_as_cookie_header() {
-      request_builder = request_builder.header("Cookie", header);
-    }
+    request_builder = creds.apply_auth(request_builder);
   }
 
   let response = request_builder

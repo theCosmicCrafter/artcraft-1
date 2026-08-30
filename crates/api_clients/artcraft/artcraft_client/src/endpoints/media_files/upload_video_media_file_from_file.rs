@@ -36,7 +36,7 @@ pub struct UploadVideoFromFileArgs<'a, P: AsRef<Path>> {
   pub maybe_generation_provider: Option<GenerationProvider>,
 
   // /// If provided, this groups the file into a batch
-  // /// TODO: This shouldn't be set clientside without the backend generating the token 
+  // /// TODO: This shouldn't be set clientside without the backend generating the token
   // ///  and cryptographically securing it. But we need to go fast here.
   // pub maybe_batch_token: Option<&'a BatchGenerationToken>,
 }
@@ -80,13 +80,11 @@ pub async fn upload_video_media_file_from_file<P: AsRef<Path>>(
   let mut request_builder = client.post(url)
       .header("User-Agent", USER_AGENT)
       .header("Accept", APPLICATION_JSON);
-  
+
   if let Some(creds) = args.maybe_creds {
-    if let Some(header) = &creds.maybe_as_cookie_header() {
-      request_builder = request_builder.header("Cookie", header);
-    }
+    request_builder = creds.apply_auth(request_builder);
   }
-  
+
   let response = request_builder
       .multipart(form)
       .send()
@@ -104,4 +102,3 @@ fn get_route(api_host: &ApiHost) -> String {
   let api_hostname_and_scheme = api_host.to_api_hostname_and_scheme();
   format!("{}/v1/media_files/upload/new_video", api_hostname_and_scheme)
 }
-

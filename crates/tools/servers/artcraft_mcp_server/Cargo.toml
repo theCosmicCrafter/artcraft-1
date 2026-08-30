@@ -41,4 +41,4 @@ anyhow = { workspace = true }
 uuid = { workspace = true }
 
 # Directories (for credentials discovery)
-directories = "5.0.1"
+directories = { workspace = true }

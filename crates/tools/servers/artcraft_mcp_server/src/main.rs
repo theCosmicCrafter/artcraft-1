@@ -38,7 +38,7 @@ async fn main() -> Result<()> {
     }
   };
 
-  let creds = match credentials::resolve_credentials() {
+  let creds = match credentials::resolve_credentials(&api_host).await {
     Ok(c) => c,
     Err(e) => {
       warn!("Warning: Credentials could not be resolved on startup: {:?}. Server starting in unauthenticated mode.", e);
@@ -360,7 +360,7 @@ async fn process_request(
     "tools/call" => {
       let params: CallToolParams = serde_json::from_value(request.params.clone().unwrap_or(Value::Null))
         .map_err(|e| anyhow!("Invalid call parameters: {:?}", e))?;
- 
+
       info!("Calling tool: {}", params.name);
 
       if creds.is_empty() {

@@ -43,7 +43,6 @@ members = [
   "crates/cli/production/lru-delete-models",
   "crates/cli/production/migration-tool",
   "crates/cli/production/support-tool",
-  "crates/cli/artcraft-mcp",
 
   # Desktop apps
   "crates/desktop/artcraft",
@@ -328,6 +327,7 @@ bytes = "1.11.1"
 chrono = { version = "0.4.44", features = ["serde"] }
 clap = { version = "=4.5.60", features = ["derive"] }
 cookie = "0.18.1"
+directories = "6.0.0"
 dotenv = "0.15.0"
 elasticsearch = { version = "8.5.0-alpha.1", default-features = false, features = ["rustls-tls"] }
 env = "1.0.1"
@@ -386,4 +386,3 @@ walkdir = "2.4.0"
 #   choco install nasm -y
 wreq-util = "3.0.0-rc.10"
 wreq = { version = "6.0.0-rc.28", features = ["json", "query", "form", "multipart", "cookies", "ws", "stream", "gzip", "brotli", "zstd", "deflate"] }
-

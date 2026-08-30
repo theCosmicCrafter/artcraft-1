@@ -1,0 +1,87 @@
+# Reuse the project's .gitignore patterns where available
+:include .gitignore
+
+# Dependencies and virtual environments
+node_modules/
+.venv/
+venv/
+env/
+.env/
+__pycache__/
+*.pyc
+site-packages/
+.tox/
+.npm/
+.yarn/
+vendor/
+
+# Build outputs and generated artifacts
+dist/
+build/
+out/
+.next/
+*.egg-info/
+coverage/
+.pytest_cache/
+.mypy_cache/
+.cache/
+*.min.js
+*.binlog
+*.lock
+.nupkg
+*.snupkg
+
+# IDE and tool configs
+.devin/
+.windsurf/
+.idea/
+.vs/
+.history/
+.localhistory/
+.vshistory/
+.ionide/
+.mfractor/
+*.sln.iml
+
+# Logs, databases, and media
+logs/
+*.log
+*.db
+*.sqlite
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.bmp
+*.gif
+*.mp4
+*.mov
+*.mp3
+*.wav
+*.flac
+
+# Lockfiles (no actionable code)
+package-lock.json
+pnpm-lock.yaml
+yarn.lock
+poetry.lock
+project.lock.json
+project.fragment.lock.json
+
+# Semgrep internal
+.semgrep/
+.semgrep_logs/
+
+# Ensure tests remain scannable if .gitignore ignores them
+!tests/
+!test/
+!testsuite/
+!*_test.go
+!*_test.py
+!*_test.js
+!*_test.ts
+!*_test.rb
+!*_test.java
+!*_test.cs
+!*_test.rs
+!*_spec.*

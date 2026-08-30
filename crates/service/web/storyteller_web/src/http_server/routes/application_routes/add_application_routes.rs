@@ -3,6 +3,7 @@ use crate::http_server::routes::application_routes::api_keys_routes::add_api_key
 use crate::http_server::routes::application_routes::billing_fakeyou_routes::add_billing_fakeyou_routes;
 use crate::http_server::routes::application_routes::character_routes::add_character_routes;
 use crate::http_server::routes::application_routes::comments_routes::add_comments_routes;
+use crate::http_server::routes::application_routes::content_policy_routes::add_content_policy_routes;
 use crate::http_server::routes::application_routes::credits_routes::add_credits_routes;
 use crate::http_server::routes::application_routes::dev_routes::add_dev_routes;
 use crate::http_server::routes::application_routes::featured_item_routes::add_featured_item_routes;
@@ -56,7 +57,7 @@ where
   app = add_character_routes(app); // /v1/character/... and /v1/characters/...
   app = add_webhook_routes(app); // /v1/webhooks/... (fal)
   app = add_internal_routes(app); // /v1/internal/... (internal API key authenticated worker fleets)
-  
+
   // Legacy FakeYou surface area that might be useful again one day
   app = add_weights_routes(app); // v1/weights
 
@@ -66,6 +67,7 @@ where
   app = add_tag_routes(app); // /v1/tags/...
   app = add_api_keys_routes(app); // /v1/api_keys/...
   app = add_mcp_session_routes(app); // /v1/mcp/session/...
+  app = add_content_policy_routes(app); // /v1/content_policy/...
   app = add_featured_item_routes(app); // /v1/featured_item/...
   app = add_prompts_routes(app); // /v1/prompts/...
 

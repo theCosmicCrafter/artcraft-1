@@ -89,6 +89,49 @@ jobs:
           $config.build.beforeBuildCommand = ""
           $config | ConvertTo-Json -Depth 10 | Set-Content tauri.conf.json
 
+      - name: Provision embeddable Python for the Companion
+        # Must run before "build and publish" below: tauri.conf.json's
+        # bundle.resources copies companion/ (see artcraft-studio-plan/
+        # SYSTEM_DESIGN.md §1/DEVOPS.md §2) wholesale into the installed
+        # app's resource directory, so companion/python/ has to exist on
+        # disk by the time `tauri build` runs, or the packaged app ships
+        # with no interpreter and companion_launch_config.rs's packaged-mode
+        # resolver falls through with an error. Uses python-build-standalone
+        # (github.com/astral-sh/python-build-standalone) rather than
+        # python.org's embeddable package - it already bundles pip, no
+        # separate get-pip.py bootstrap/._pth edit needed, and the same tool
+        # is used for the macOS build below for one consistent recipe
+        # instead of two different ones.
+        #
+        # `gh release download --pattern` (not a hardcoded version-pinned
+        # URL) so this doesn't silently break every time upstream cuts a
+        # new dated release - it always grabs whatever asset in the latest
+        # release matches this Python minor version + platform.
+        #
+        # Not exercised against a real `tauri build` in the session that
+        # wrote this (no tauri/cargo-tauri CLI available there to test
+        # with) - if this step's archive-layout assumption
+        # (companion/python/python.exe landing at exactly that path after
+        # extraction) turns out wrong, the explicit existence check at the
+        # end is designed to fail this job loudly rather than let a broken
+        # installer ship silently.
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $companionDir = "${{ github.workspace }}/companion"
+          gh release download --repo astral-sh/python-build-standalone `
+            --pattern "cpython-3.11.*-x86_64-pc-windows-msvc-install_only.tar.gz" `
+            --output python-standalone.tar.gz --clobber
+          tar -xzf python-standalone.tar.gz -C $companionDir
+          # Archive's own top-level "python/" directory lands directly at
+          # companion/python/ - see this step's header comment.
+          if (-not (Test-Path "$companionDir/python/python.exe")) {
+            Write-Error "Expected $companionDir/python/python.exe after extracting python-build-standalone - archive layout assumption was wrong, see this step's comment."
+            exit 1
+          }
+          & "$companionDir/python/python.exe" -m pip install --no-warn-script-location -r "$companionDir/requirements.txt"
+
       - name: build and publish
         uses: tauri-apps/tauri-action@v0
         env:

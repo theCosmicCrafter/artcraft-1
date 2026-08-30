@@ -39,6 +39,7 @@ use crate::http_server::endpoints::beta_keys::redeem_beta_key_handler::*;
 use crate::http_server::endpoints::comments::create_comment_handler::*;
 use crate::http_server::endpoints::comments::delete_comment_handler::*;
 use crate::http_server::endpoints::comments::list_comments_handler::*;
+use crate::http_server::endpoints::content_policy::record_content_policy_violation_handler::*;
 use crate::http_server::endpoints::featured_items::create_featured_item_handler::*;
 use crate::http_server::endpoints::featured_items::delete_featured_item_handler::*;
 use crate::http_server::endpoints::featured_items::get_is_featured_item_handler::*;
@@ -97,6 +98,7 @@ use artcraft_api_defs::moderation::debug_logs::moderation_list_debug_logs_for_to
 use artcraft_api_defs::moderation::debug_logs::moderation_list_debug_logs_for_user::*;
 use crate::http_server::endpoints::moderation::dashboards::moderator_list_databox_dashboards_handler::*;
 use crate::http_server::endpoints::moderation::jobs::moderation_get_job_by_token_handler::*;
+use crate::http_server::endpoints::moderation::content_policy_violations::moderator_list_content_policy_violations_handler::*;
 use crate::http_server::endpoints::moderation::user_feature_flags::moderator_edit_user_feature_flags_handler::*;
 use crate::http_server::endpoints::moderation::user_feature_flags::moderator_list_all_available_user_feature_flags_handler::*;
 use crate::http_server::endpoints::moderation::user_feature_flags::moderator_list_user_feature_flags_handler::*;
@@ -289,6 +291,8 @@ use crate::http_server::endpoints::weights::update::set_model_weight_cover_image
 use crate::http_server::endpoints::weights::update::update_weight_handler::*;
 use enums::by_table::beta_keys::beta_key_product::BetaKeyProduct;
 use enums::by_table::comments::comment_entity_type::CommentEntityType;
+use enums::by_table::content_policy_violations::content_policy_violation_action::ContentPolicyViolationAction;
+use enums::by_table::content_policy_violations::content_policy_violation_source::ContentPolicyViolationSource;
 use enums::by_table::featured_items::featured_item_entity_type::FeaturedItemEntityType;
 use enums::by_table::generic_inference_jobs::frontend_failure_category::FrontendFailureCategory;
 use enums::by_table::generic_inference_jobs::inference_category::InferenceCategory;
@@ -479,6 +483,8 @@ use crate::http_server::endpoints::media_files::list::list_batch_generated_redux
     crate::http_server::endpoints::comments::create_comment_handler::create_comment_handler,
     crate::http_server::endpoints::comments::delete_comment_handler::delete_comment_handler,
     crate::http_server::endpoints::comments::list_comments_handler::list_comments_handler,
+    crate::http_server::endpoints::content_policy::record_content_policy_violation_handler::record_content_policy_violation_handler,
+    crate::http_server::endpoints::moderation::content_policy_violations::moderator_list_content_policy_violations_handler::moderator_list_content_policy_violations_handler,
     crate::http_server::endpoints::featured_items::create_featured_item_handler::create_featured_item_handler,
     crate::http_server::endpoints::featured_items::delete_featured_item_handler::delete_featured_item_handler,
     crate::http_server::endpoints::featured_items::get_is_featured_item_handler::get_is_featured_item_handler,
@@ -1491,6 +1497,18 @@ use crate::http_server::endpoints::media_files::list::list_batch_generated_redux
 
     // User Emails (Moderation)
     ModeratorListUserEmailChangesQueryParams,
+
+    // Content Policy
+    ContentPolicyViolationSource,
+    ContentPolicyViolationAction,
+    RecordContentPolicyViolationRequest,
+    RecordContentPolicyViolationResponse,
+
+    // Content Policy Violations (Moderation)
+    ListContentPolicyViolationsPathInfo,
+    ListContentPolicyViolationsQuery,
+    ContentPolicyViolationSummary,
+    ModeratorListContentPolicyViolationsResponse,
 
     // API keys
     ApiKeyInfo,

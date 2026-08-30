@@ -1,0 +1,3 @@
+[pyinstaller40]
+hook-dirs = cmap.__pyinstaller:get_hook_dirs
+tests = cmap.__pyinstaller:get_test_dirs

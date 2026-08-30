@@ -73,6 +73,7 @@ import { PageBackgroundChange } from "./PageBackgroundChange";
 import { PageScene } from "./PageScene";
 import { PageVideoEditor } from "./PageVideoEditor";
 import { PageMoodboard } from "./PageMoodboard";
+import { PageMediaLibrary } from "./PageMediaLibrary";
 import {
   topNavMediaId,
   topNavMediaUrl,
@@ -326,6 +327,11 @@ const TabBody = ({ sceneToken }: { sceneToken?: string }) => {
           <PageMoodboard />
         </div>
       );
+    case "MEDIA_LIBRARY":
+      // PageMediaLibrary positions itself (fixed inset-0 + pt-[56px] for the
+      // TopBar), unlike the plain-div-wrapped cases above, so no wrapper
+      // needed here.
+      return <PageMediaLibrary />;
     default:
       return null;
   }

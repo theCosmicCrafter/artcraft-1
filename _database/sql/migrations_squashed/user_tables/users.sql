@@ -259,6 +259,24 @@ CREATE TABLE users (
   -- The last moderator that made changes.
   maybe_mod_user_token VARCHAR(32) DEFAULT NULL,
 
+  -- ========== ARTCRAFT STUDIO: AGE VERIFICATION & COMPLIANCE ==========
+  -- See artcraft-studio-plan/SYSTEM_DESIGN.md §2/§5 and PRD.md §8.
+
+  -- Self-reported or ID-verified date of birth. NULL until first provided.
+  date_of_birth DATE DEFAULT NULL,
+
+  -- Rust enum: AgeVerificationStatus (crates/schema/public/enums/src/by_table/users/age_verification_status.rs)
+  age_verification_status VARCHAR(32) NOT NULL DEFAULT 'unverified',
+
+  age_verified_at TIMESTAMP NULL DEFAULT NULL,
+
+  -- ISO 3166-1 alpha-2 country code, e.g. "US". NULL until first resolved.
+  maybe_compliance_country VARCHAR(2) DEFAULT NULL,
+
+  -- Rust enum: ComplianceRegime (crates/schema/public/enums/src/by_table/users/compliance_regime.rs)
+  -- 'optin' | 'optout'. NULL until first resolved.
+  maybe_compliance_regime VARCHAR(16) DEFAULT NULL,
+
   -- ========== VECTOR CLOCK ==========
 
   -- Incremented with every update.
@@ -283,7 +301,8 @@ CREATE TABLE users (
   KEY index_can_access_studio (can_access_studio),
   KEY index_is_api_user (is_api_user),
   KEY fk_maybe_avatar_media_file_token (maybe_avatar_media_file_token),
-  KEY fk_maybe_cover_media_file_token (maybe_cover_media_file_token)
+  KEY fk_maybe_cover_media_file_token (maybe_cover_media_file_token),
+  KEY index_age_verification_status (age_verification_status)
 
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 

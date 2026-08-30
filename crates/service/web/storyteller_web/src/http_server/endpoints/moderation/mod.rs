@@ -1,4 +1,5 @@
 pub mod alerts;
+pub mod content_policy_violations;
 pub mod dashboards;
 pub mod debug_logs;
 pub mod info;

@@ -72,6 +72,14 @@ frontend/apps/artcraft/bundle-report.html
 
 # Python noise
 __pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+
+# ArtCraft Studio: Companion Service (Python) — see companion/README.md
+companion/.venv/
+# OpenCV binary is too large for GitHub; installed into the bundled Python at build time
+companion/python/Lib/site-packages/cv2/cv2.pyd
 
 # We use diesel for DB migrations only. We don't care about its codgen.
 _ignored_schema.rs
@@ -106,4 +114,3 @@ windows/sqlite/sqlite3.lib
 # ArtCraft Windows DLLs
 crates/desktop/src-tauri/*.dll
 windows_dlls/
-

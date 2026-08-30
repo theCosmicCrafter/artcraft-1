@@ -1,0 +1,16 @@
+{
+  "authors": [
+    "Masataka Okabe",
+    "Kei Ito"
+  ],
+  "category": "qualitative",
+  "colormaps": {
+    "okabeito": {
+      "data": "cmap.data.okabeito:okabeito",
+      "info": "Qualitative color palette for color-vision deficiencies, developed by Kei Ito and Masataka Okabe. This palette was also mentioned in Bang Wong's <a href='https://www.nature.com/articles/nmeth.1618'>perspective in Nature Methods</a> (2011).",
+      "interpolation": false
+    }
+  },
+  "namespace": "okabeito",
+  "source": "https://jfly.uni-koeln.de/color/"
+}

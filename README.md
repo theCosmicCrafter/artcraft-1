@@ -1,3 +1,57 @@
+> ## ArtCraft Studio (this fork)
+>
+> This repository is **ArtCraft Studio**, a fork of [ArtCraft](https://github.com/storytold/artcraft)
+> (cloned from its `main` branch, full history preserved — see `git remote -v`, `upstream-artcraft`)
+> that merges in the local-library, semantic-search, and orchestration-agent capabilities of a
+> second product, Stimma, as a new bundled **Companion Service** at [`companion/`](./companion/).
+>
+> - **Planning package** (PRD, system design, UI/UX plan, DevOps package):
+>   [`../artcraft-studio-plan/`](../artcraft-studio-plan/README.md) — read this first.
+> - **What's new here vs. upstream ArtCraft**: [`companion/`](./companion/) (the Python
+>   Companion Service, evolved from Stimma's backend — see `companion/README.md`). Everything
+>   else in this tree is inherited from ArtCraft and, per the merge plan, continues to run
+>   against ArtCraft's existing production backend/accounts/billing — this fork does not stand
+>   up a separate backend deployment.
+> - **Status**: Phase 1 (generation + local library) has a real, tested, reachable spine.
+>   Full backlog, evidence, and open caveats: **read
+>   [`../artcraft-studio-plan/SPRINT_PLAN.md`](../artcraft-studio-plan/SPRINT_PLAN.md) first** —
+>   this section is a summary, that file is the source of truth and is kept current.
+>
+>   **Done**: Companion Service spawns/health-checks/restarts via a Rust supervisor with a
+>   shared-secret auth handshake; MySQL migrations + moderation endpoints wired into
+>   `storyteller-web`; a real authenticated Companion HTTP client (not just supervisor status);
+>   a first reachable screen (`Media Library` tab — search + grid backed by the Companion's real
+>   `/api/media`); an Eagle `.library` importer (parser + a real read+write import into
+>   MediaItem/Asset/Tag/Board, idempotent re-runs, 8 tests); the full companion pytest suite
+>   (323 tests) running and passing (322/323 — the 1 remaining is a deliberate non-fix, not a
+>   bug); two real cross-platform bugs found and fixed along the way (a workspace-jail check and
+>   a glob tool that both silently broke on Windows); an explicit, pinned `ruff` config (the
+>   previous "~400 violations" figure was accidentally version-dependent — now it isn't); the
+>   most user/LLM-visible "Stimma" branding leaks fixed (the agent's own system prompt, the API
+>   doc title, log filenames); **packaged Python distribution for release builds** — a
+>   packaged-vs-dev launch dispatcher in `companion_launch_config.rs`, `bundle.resources` wired
+>   into both Tauri configs, new CI provisioning steps in both publish workflows, and verified for
+>   real (not just reasoned about): a downloaded `python-build-standalone` interpreter installed
+>   the actual `requirements.txt` and successfully booted the actual `companion/backend/main.py`
+>   to a working port-announce line. `cargo check -p artcraft` passed in the earlier sprint
+verification; the latest Windows rerun is currently blocked in the native `boring-sys2`
+dependency because the local C/C++ toolchain cannot find `stddef.h`.
+>
+>   **Not yet done**: an actual `tauri build` producing a real installer end-to-end (no CLI
+>   available in this environment — the packaging mechanism itself is built and strongly
+>   verified, but the Rust supervisor spawning it inside a real running app isn't); the
+>   medialibrary/Eagle-import UI is a first cut, not `UI_UX_PLAN.md` §5's full design pass; the
+>   deeper `StimmaSDK`/`.stimma/` API-surface rename and the dead "Stimma Cloud" auth/billing code
+>   removal (both deliberately deferred, not silently skipped — see the sprint plan for why);
+>   macOS packaging steps beyond confirming the release assets exist (no macOS environment
+>   available); Phases 2 (agent/Flows/STP) and 3 (Darkroom/marketplace/cloud-sync) haven't been
+>   started — this pass scoped to Phase 1 specifically, stated explicitly rather than assumed.
+>
+> The README below this point is inherited from upstream ArtCraft and describes the
+> capabilities ArtCraft Studio builds on, not (yet) ArtCraft Studio's own feature set.
+
+---
+
 <p align="center">
   <video src="https://github.com/user-attachments/assets/b4e24c27-d87d-4fd1-8599-dc0d0b8af48d" width="100%" autoplay="true" loop controls>
 </p>
@@ -22,7 +76,7 @@ This is Adobe Photoshop for everyone, and we're giving away the source code!
 
 Text-to-image is great, but artists *need control*. It's important to know what your image will look like before you generate it, and it's vitally important to achieve consistency and repeatability.
 
-| Feature                           | Demo + Explanation                                                                                                                                                                                                                                                      
+| Feature                           | Demo + Explanation
 |-----------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | **Image to Location**             | ![Video](https://github.com/user-attachments/assets/21f103e3-cc19-4882-a630-9caa1b76ae31) Placing virtual actors into physical environments establishes single-location consistency. You can film multiple shots within a room without having things disappear.         |
 | **3D Image Compositing**          | ![Video](https://github.com/user-attachments/assets/f93a616f-571d-474e-bcc0-53736de7303d) Use images (backdrops, foreground elements, props, etc.) in scenes with depth and blend them naturally together. Just a couple of images usually leads to great compositions. |
@@ -42,7 +96,7 @@ Note: all of the above videos were generated for free with Grok Video; the cost 
 ## Quick and Easy Prompting
 We haven't abandoned text-to-asset generation for quick prototyping and ideation. We support every popular workflow in a first class fashion.
 
-| Feature               | Demo + Explanation                                                                                                                                    
+| Feature               | Demo + Explanation
 |-----------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------|
 | **Text to Image**     | ![Video](https://github.com/user-attachments/assets/9cc289cd-faf4-4eaf-aed2-21134cce127c) Text prompt over a dozen different image models.            |
 | **Image Editing**     | ![Video](https://github.com/user-attachments/assets/a06fa6ad-936c-42d0-8767-48fdbb8ff141) Edit with Nano Banana Pro and GPT Image 1.5.                |
@@ -61,10 +115,10 @@ We haven't abandoned text-to-asset generation for quick prototyping and ideation
 | Sora       | Sora 1, Sora 2, GPT-Image-1                                                                                                                                             |
 | WorldLabs  | Marble (Gaussian Splat World Generation)                                                                                                                                |
 
-We're going to be adding the following providers soon: Kling (via Kling website accounts), Google (via API keys), 
+We're going to be adding the following providers soon: Kling (via Kling website accounts), Google (via API keys),
 Runway (via website account), Luma (via website account).
 
-We're potentially interested in adding other aggregators for those who already have subscriptions and credits at 
+We're potentially interested in adding other aggregators for those who already have subscriptions and credits at
 those providers, for example: OpenArt, FreePik, etc.
 
 ## Downloads
@@ -79,4 +133,3 @@ those providers, for example: OpenArt, FreePik, etc.
 - [tools, scripts, misc](./script)
 - [license](./LICENSE.md)
 - [roadmap](./ROADMAP.md)
-

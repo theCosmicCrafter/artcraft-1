@@ -242,7 +242,7 @@ pub async fn handle_generate_image(
     Some(q_str) => {
       let q_val = serde_json::Value::String(q_str.to_string());
       let parsed_q: CommonQuality = serde_json::from_value(q_val)
-        .map_err(|e| anyhow!("Invalid quality: '{}'", q_str))?;
+        .map_err(|_e| anyhow!("Invalid quality: '{}'", q_str))?;
       Some(parsed_q)
     }
     None => None

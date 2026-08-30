@@ -2,6 +2,9 @@ mod credentials;
 mod mcp_protocol;
 mod handlers;
 
+#[cfg(test)]
+mod tests;
+
 use std::io::Write;
 use anyhow::{anyhow, Result};
 use log::{error, info, warn};
@@ -10,7 +13,7 @@ use tokio::io::{self, AsyncBufReadExt, BufReader};
 
 use artcraft_client::utils::api_host::ApiHost;
 use crate::mcp_protocol::{
-  JsonRpcRequest, JsonRpcResponse, InitializeResult, ServerCapabilities, ServerInfo,
+  JsonRpcRequest, JsonRpcResponse, InitializeParams, InitializeResult, ServerCapabilities, ServerInfo,
   ToolsCapability, ListToolsResult, McpTool, CallToolParams
 };
 
@@ -95,6 +98,10 @@ async fn process_request(
 ) -> Result<Value> {
   match request.method.as_str() {
     "initialize" => {
+      let _client = request
+        .params
+        .as_ref()
+        .and_then(|p| serde_json::from_value::<InitializeParams>(p.clone()).ok());
       info!("Processing initialize request");
       let result = InitializeResult {
         protocol_version: "2024-11-05".to_string(),

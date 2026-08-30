@@ -168,6 +168,9 @@
     },
     {
       "path": "../../libs/api"
+    },
+    {
+      "path": "../../libs/components/medialibrary"
     }
   ]
 }

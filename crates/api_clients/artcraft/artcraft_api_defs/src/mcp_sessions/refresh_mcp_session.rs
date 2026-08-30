@@ -5,14 +5,14 @@ use tokens::tokens::mcp_session_refresh::McpSessionRefreshToken;
 
 // ── POST /v1/mcp/session/refresh ──
 
-#[derive(Deserialize, ToSchema)]
+#[derive(Serialize, Deserialize, ToSchema)]
 pub struct RefreshMcpSessionRequest {
   /// The session's CURRENT refresh token (from creation, or from the most recent refresh).
   /// A stale or wrong value is an error — refresh tokens rotate and are never replayable.
   pub private_refresh_token: McpSessionRefreshToken,
 }
 
-#[derive(Serialize, ToSchema)]
+#[derive(Serialize, Deserialize, ToSchema)]
 pub struct RefreshMcpSessionSuccessResponse {
   pub success: bool,
 

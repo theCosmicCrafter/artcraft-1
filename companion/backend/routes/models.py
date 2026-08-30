@@ -1,0 +1,1245 @@
+"""
+Model catalog routes.
+
+Provides the list of available LLM models for the chat model picker,
+merging Stimma Cloud catalog entries with locally configured endpoints.
+"""
+import os
+from datetime import datetime, timezone
+from typing import Optional
+from urllib.parse import urlparse
+from uuid import uuid4
+
+import httpx
+from fastapi import APIRouter, HTTPException, Query
+from pydantic import BaseModel
+
+from config import (
+    get_settings,
+    LLMEndpointConfig,
+    LLMProviderConfig,
+    LLMProviderModelConfig,
+    LLMReasoningConfig,
+)
+from config_writer import patch_global_section
+from core.logging import get_logger
+from cloud_runtime import with_cloud_access_headers
+from model_tiers import seed_effort
+from llm_resolver import (
+    PROJECT_EFFORT_COLUMNS,
+    PROJECT_ROLE_COLUMNS,
+    SETTINGS_ROLES,
+    get_max_context_tokens,
+    normalize_model_slug,
+    resolve_auto_slug,
+    resolve_role_model_slug,
+    set_catalog_cache,
+)
+from privacy_lockdown import is_privacy_lockdown_enabled
+from llm_provider_catalog import (
+    FIXED_MODEL_PROVIDERS,
+    PROFILED_MODEL_PROVIDERS,
+    PROVIDER_DEFAULTS,
+    branded_models,
+    discovered_model,
+)
+
+router = APIRouter(prefix="/api/models", tags=["models"])
+log = get_logger(__name__)
+
+PUBLIC_CLOUD_FALLBACK_MODELS = {
+    "stimma:minimax-m3": "MiniMax M3",
+}
+
+REQUIRED_MODEL_PROFILE_SCENARIOS = ("text", "tools", "vision", "thinking", "context")
+FIREWORKS_CATALOG_URL = "https://api.fireworks.ai/v1/accounts/fireworks/models"
+# Together's models API labels both text-only and multimodal models as `chat`
+# and does not expose input modalities. Keep this aligned with the provider's
+# serverless Vision catalog; behavioral profiling still verifies each model
+# before it can be added.
+TOGETHER_VISION_MODEL_IDS = {
+    "google/gemma-4-31b-it",
+    "minimaxai/minimax-m3",
+    "moonshotai/kimi-k2.6",
+    "moonshotai/kimi-k2.7-code",
+    "qwen/qwen3.5-9b",
+}
+
+
+class ProviderCreateRequest(BaseModel):
+    model_config = {"protected_namespaces": ()}
+    kind: str
+    name: Optional[str] = None
+    base_url: Optional[str] = None
+    api_key: Optional[str] = None
+    model_ids: Optional[list[str]] = None
+
+
+class ProviderUpdateRequest(BaseModel):
+    model_config = {"protected_namespaces": ()}
+    name: Optional[str] = None
+    base_url: Optional[str] = None
+    api_key: Optional[str] = None
+    enabled: Optional[bool] = None
+    model_ids: Optional[list[str]] = None
+    models: Optional[list[dict]] = None
+
+
+class ProviderModelProfileRequest(BaseModel):
+    model_config = {"protected_namespaces": ()}
+    model_id: str
+    name: Optional[str] = None
+    max_context_tokens: Optional[int] = None
+
+
+def _active_providers() -> list[LLMProviderConfig]:
+    return [
+        provider for provider in getattr(get_settings(), "llm_providers", [])
+        if not provider.deleted_at
+    ]
+
+
+def _provider_display_name(provider: LLMProviderConfig) -> str:
+    normalized_name = provider.name.strip().lower()
+    generic_local_name = normalized_name in {
+        "local llm", "local ai", "local endpoint",
+    } or normalized_name.startswith(("local llm ·", "local ai ·", "local endpoint ·"))
+    if provider.kind == "local" and generic_local_name:
+        # Early provider builds wrote a generic product label into config. A
+        # local server is a provider in its own right, so identify it by host.
+        return urlparse(provider.base_url).netloc or (
+            provider.models[0].name if provider.models else "Model endpoint"
+        )
+    return provider.name
+
+
+def _provider_response(provider: LLMProviderConfig) -> dict:
+    data = provider.model_dump(exclude={"api_key"})
+    data["name"] = _provider_display_name(provider)
+    data["api_key_set"] = bool(provider.api_key)
+    data["api_key"] = "***" if provider.api_key else None
+    if (
+        provider.kind == "openrouter"
+        and provider.last_test_passed is True
+        and not provider.credentials_validated_at
+    ):
+        data["last_test_passed"] = None
+    return data
+
+
+def _canonical_model_id(kind: str, model_id: str) -> str:
+    if kind not in {"openrouter", "together", "fireworks"}:
+        return f"{kind}:{model_id}"
+    known = {
+        "minimax/minimax-m3": "minimax:minimax-m3",
+        "minimaxai/minimax-m3": "minimax:minimax-m3",
+        "qwen/qwen3.7-plus": "qwen:qwen-3.7-plus",
+        "moonshotai/kimi-k2.7-code": "moonshot:kimi-k2.7",
+        "moonshotai/kimi-k2.7": "moonshot:kimi-k2.7",
+        "stepfun/step-3.7-flash": "stepfun:step-3.7-flash",
+        "accounts/fireworks/models/kimi-k2p6": "moonshot:kimi-k2.6",
+        "accounts/fireworks/models/glm-5p1": "zai:glm-5.1",
+        "accounts/fireworks/models/glm-5p2": "zai:glm-5.2",
+        "accounts/fireworks/models/gpt-oss-120b": "openai:gpt-oss-120b",
+        "accounts/fireworks/models/deepseek-v4-pro": "deepseek:deepseek-v4-pro",
+    }
+    normalized = model_id.lower()
+    if normalized in known:
+        return known[normalized]
+    if "/" not in model_id:
+        return f"{kind}:{model_id}"
+    upstream, upstream_model = model_id.split("/", 1)
+    upstream = {
+        "minimaxai": "minimax", "moonshotai": "moonshot",
+        "qwen": "qwen", "zai-org": "zai", "x-ai": "xai",
+    }.get(upstream.lower(), upstream.lower())
+    return f"{upstream}:{upstream_model}"
+
+
+def _save_providers(providers: list[LLMProviderConfig]) -> None:
+    patch_global_section("llm_providers", [provider.model_dump() for provider in providers])
+    # Config reload is file-watcher driven. Keep this process authoritative
+    # immediately so a GET following provider creation cannot return the old
+    # unconfigured state.
+    get_settings().llm_providers = providers
+
+
+def _validated_models(provider: LLMProviderConfig, rows: list[dict]) -> list[LLMProviderModelConfig]:
+    models = [LLMProviderModelConfig.model_validate(row) for row in rows]
+    existing_ids = {model.id for model in provider.models}
+    seen: set[str] = set()
+    for model in models:
+        if not model.model_id.strip():
+            raise HTTPException(status_code=400, detail="Model ID is required.")
+        expected_id = f"{provider.id}:{model.model_id}"
+        if model.id != expected_id or model.id in seen:
+            raise HTTPException(status_code=400, detail="Model identifier is invalid.")
+        seen.add(model.id)
+        if model.max_context_tokens < 1024:
+            raise HTTPException(status_code=400, detail="Context window is too small.")
+        reasoning = model.reasoning
+        if not reasoning.levels:
+            raise HTTPException(status_code=400, detail="A reasoning level is required.")
+        if reasoning.default not in reasoning.levels:
+            reasoning.default = reasoning.levels[0]
+        # Quick tasks always use the model's minimum advertised level.
+        reasoning.quick_task = reasoning.levels[0]
+        missing_wire = [level for level in reasoning.levels if level not in reasoning.wire_levels]
+        if reasoning.control != "none" and missing_wire:
+            raise HTTPException(status_code=400, detail=f"Missing request value for: {missing_wire[0]}.")
+        if provider.kind in PROFILED_MODEL_PROVIDERS and model.id not in existing_ids:
+            capability_gaps = []
+            if "image" not in model.input_modalities:
+                capability_gaps.append("vision")
+            if not model.supports_tools:
+                capability_gaps.append("tools")
+            if model.reasoning.mode == "none":
+                capability_gaps.append("reasoning")
+            if capability_gaps:
+                raise HTTPException(
+                    status_code=400,
+                    detail=_capability_requirement_detail(capability_gaps),
+                )
+            passed_required = model.last_test_passed is True and all(
+                model.last_test_results.get(scenario, {}).get("passed") is True
+                for scenario in REQUIRED_MODEL_PROFILE_SCENARIOS
+            )
+            if not passed_required:
+                raise HTTPException(status_code=400, detail="The model must pass its tests before it can be added.")
+    return models
+
+
+def _provider_headers(provider: LLMProviderConfig) -> dict[str, str]:
+    if provider.kind == "anthropic":
+        return {
+            "x-api-key": provider.api_key or "",
+            "anthropic-version": "2023-06-01",
+        }
+    return {"Authorization": f"Bearer {provider.api_key}"} if provider.api_key else {}
+
+
+def _provider_error_detail(
+    response: httpx.Response,
+    *,
+    models_endpoint: bool = False,
+) -> str:
+    """Turn common provider failures into concise, actionable UI copy."""
+    body = response.text.lower()
+    status = response.status_code
+    insufficient_funds = (
+        "insufficient balance",
+        "insufficient credit",
+        "insufficient funds",
+        "payment required",
+        "out of credit",
+        "out of funds",
+    )
+    invalid_key = (
+        "incorrect api key",
+        "invalid api key",
+        "invalid_api_key",
+        "invalid bearer",
+        "invalid token",
+        "authentication failed",
+        "unauthorized",
+    )
+
+    if status == 402 or any(phrase in body for phrase in insufficient_funds):
+        return "This account has insufficient funds."
+    if status == 401 or any(phrase in body for phrase in invalid_key):
+        return "API key is invalid."
+    if status == 429 or "rate limit" in body or "too many requests" in body:
+        return "The provider is rate limiting requests. Try again shortly."
+    if status == 403:
+        return "This key does not have permission to use this provider."
+    if status == 404 and models_endpoint:
+        return "This server does not have a models endpoint."
+    if status >= 500:
+        return "The provider is unavailable."
+    return "The provider rejected this key."
+
+
+def _openrouter_capability_gaps(row: dict) -> list[str]:
+    architecture = row.get("architecture") if isinstance(row.get("architecture"), dict) else {}
+    input_modalities = {
+        str(modality).lower()
+        for modality in architecture.get("input_modalities", [])
+    }
+    supported_parameters = row.get("supported_parameters", [])
+    if isinstance(supported_parameters, dict):
+        supported_parameters = supported_parameters.keys()
+    supported_parameters = {str(parameter).lower() for parameter in supported_parameters}
+
+    gaps = []
+    if "image" not in input_modalities:
+        gaps.append("vision")
+    if "tools" not in supported_parameters:
+        gaps.append("tools")
+    if not isinstance(row.get("reasoning"), dict):
+        gaps.append("reasoning")
+    return gaps
+
+
+def _together_capability_gaps(row: dict) -> list[str]:
+    # Together's /models response does not distinguish text-only chat models
+    # from the much smaller vision catalog. Only offer the models Together
+    # explicitly documents as accepting image input.
+    model_id = str(row.get("id") or row.get("name") or "").lower()
+    if (
+        str(row.get("type") or "").lower() != "chat"
+        or model_id not in TOGETHER_VISION_MODEL_IDS
+    ):
+        return ["vision"]
+    return []
+
+
+def _fireworks_capability_gaps(row: dict) -> list[str]:
+    gaps = []
+    if not (row.get("supportsImageInput") or row.get("supports_image_input")):
+        gaps.append("vision")
+    if not (row.get("supportsTools") or row.get("supports_tools")):
+        gaps.append("tools")
+    # Fireworks' management catalog does not currently expose a reasoning
+    # capability. The model profiler verifies reasoning before a model can be
+    # added; do not infer it from model IDs or marketing names here.
+    return gaps
+
+
+def _provider_capability_gaps(provider: LLMProviderConfig, row: dict) -> list[str]:
+    if provider.kind == "openrouter":
+        return _openrouter_capability_gaps(row)
+    if provider.kind == "together":
+        return _together_capability_gaps(row)
+    if provider.kind == "fireworks":
+        return _fireworks_capability_gaps(row)
+    return []
+
+
+def _capability_requirement_detail(gaps: list[str]) -> str:
+    labels = {"vision": "Vision", "tools": "tools", "reasoning": "reasoning"}
+    missing = [labels[gap] for gap in gaps]
+    if len(missing) == 1:
+        return f"{missing[0].capitalize()} is required."
+    return f"{', '.join(missing[:-1])}, and {missing[-1]} are required."
+
+
+def _require_provider_capabilities(provider: LLMProviderConfig, row: dict) -> None:
+    gaps = _provider_capability_gaps(provider, row)
+    if gaps:
+        raise HTTPException(status_code=400, detail=_capability_requirement_detail(gaps))
+
+
+def _selectable_provider_rows(provider: LLMProviderConfig, rows: list[dict]) -> list[dict]:
+    if provider.kind not in {"openrouter", "together", "fireworks"}:
+        return rows
+    selectable = [row for row in rows if not _provider_capability_gaps(provider, row)]
+    if provider.kind == "fireworks":
+        selectable = [
+            row for row in selectable
+            if row.get("supportsServerless") is True
+            and (
+                not isinstance(row.get("status"), dict)
+                or row["status"].get("code") == "OK"
+            )
+            and not row.get("deprecationDate")
+        ]
+    return selectable
+
+
+def _apply_openrouter_reasoning_metadata(model: LLMProviderModelConfig, row: dict) -> None:
+    metadata = row.get("reasoning")
+    if not isinstance(metadata, dict):
+        return
+
+    effort_order = ["minimal", "low", "medium", "high", "xhigh", "max"]
+    advertised = metadata.get("supported_efforts")
+    efforts = (
+        [level for level in effort_order if level in advertised]
+        if isinstance(advertised, list)
+        else effort_order
+    )
+    if not efforts:
+        efforts = ["medium"]
+    mandatory = metadata.get("mandatory") is True
+    levels = efforts if mandatory else ["off", *efforts]
+    advertised_default = str(metadata.get("default_effort") or "").lower()
+    default = advertised_default if advertised_default in levels else (
+        efforts[0] if mandatory else ("medium" if "medium" in levels else efforts[0])
+    )
+    if metadata.get("default_enabled") is False and not mandatory:
+        default = "off"
+    model.reasoning = LLMReasoningConfig(
+        mode="required" if mandatory else "optional",
+        levels=levels,
+        default=default,
+        quick_task=efforts[0] if mandatory else "off",
+        control="openrouter_effort",
+        wire_levels={level: ("none" if level == "off" else level) for level in levels},
+    )
+
+
+def _apply_local_profile(
+    model: LLMProviderModelConfig,
+    scenarios,
+    detected,
+    provider_kind: str | None = None,
+) -> None:
+    """Carry the existing local-endpoint profiler into the provider model."""
+    tools = scenarios.get("tools")
+    vision = scenarios.get("vision")
+    model.supports_tools = bool(tools and tools.passed)
+    model.input_modalities = ["text", "image"] if vision and vision.passed else ["text"]
+    method = getattr(detected, "reasoning_method", None) if detected else None
+    mode = getattr(detected, "reasoning_mode", None) if detected else None
+    model.detected_runtime = getattr(detected, "runtime", None) if detected else None
+    model.reasoning_output = getattr(detected, "reasoning_output", None) if detected else None
+    control = {
+        "reasoning_effort": "openai_effort",
+        "enable_thinking": "enable_thinking",
+        "openrouter": "openrouter_effort",
+        "think": "think",
+        "reasoning_budget": "reasoning_budget",
+    }.get(method, "none")
+    if provider_kind == "fireworks" and control == "openai_effort":
+        control = "fireworks_effort"
+    if model.reasoning_control_source == "manual":
+        return
+    if mode == "always":
+        model.reasoning = LLMReasoningConfig(
+            mode="required", levels=["high"], default="high", quick_task="high",
+            control=control, wire_levels={"high": True if control in {"enable_thinking", "think"} else "high"},
+        )
+    elif mode == "toggleable":
+        model.reasoning = LLMReasoningConfig(
+            mode="optional", levels=["off", "high"], default="high", quick_task="off",
+            control=control,
+            wire_levels={
+                "off": False if control in {"enable_thinking", "think"} else "none",
+                "high": True if control in {"enable_thinking", "think"} else "high",
+            },
+        )
+    else:
+        model.reasoning = LLMReasoningConfig(
+            mode="none", levels=["off"], default="off", quick_task="off",
+            control="none", wire_levels={"off": "off"},
+        )
+
+
+async def _preview_provider(request: ProviderCreateRequest) -> tuple[LLMProviderConfig, list[dict]]:
+    if request.kind not in PROVIDER_DEFAULTS:
+        raise HTTPException(status_code=400, detail="Unsupported provider type.")
+    defaults = PROVIDER_DEFAULTS[request.kind]
+    provider = LLMProviderConfig(
+        id=f"{request.kind}-preview",
+        kind=request.kind,
+        name=(request.name or defaults["name"]).strip(),
+        base_url=(request.base_url or defaults["base_url"]).strip().rstrip("/"),
+        api_key=request.api_key or None,
+    )
+    if request.kind != "local" and not provider.api_key:
+        raise HTTPException(status_code=400, detail="API key is required.")
+    return provider, await _discover_provider_models(provider)
+
+
+async def _fetch_fireworks_catalog(
+    client: httpx.AsyncClient,
+    provider: LLMProviderConfig,
+) -> list[dict]:
+    rows: list[dict] = []
+    page_token: Optional[str] = None
+    for _ in range(20):
+        params = {"pageSize": 200}
+        if page_token:
+            params["pageToken"] = page_token
+        response = await client.get(
+            FIREWORKS_CATALOG_URL,
+            headers=_provider_headers(provider),
+            params=params,
+            timeout=10.0,
+        )
+        if response.status_code >= 400:
+            raise HTTPException(
+                status_code=400,
+                detail=_provider_error_detail(response, models_endpoint=True),
+            )
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail="The models endpoint returned invalid JSON.",
+            ) from exc
+        page_rows = payload.get("models", []) if isinstance(payload, dict) else []
+        rows.extend(row for row in page_rows if isinstance(row, dict))
+        page_token = payload.get("nextPageToken") if isinstance(payload, dict) else None
+        if not page_token:
+            return rows
+    raise HTTPException(status_code=400, detail="The Fireworks model catalog did not finish loading.")
+
+
+async def _discover_provider_models(provider: LLMProviderConfig) -> list[dict]:
+    try:
+        async with httpx.AsyncClient() as client:
+            if provider.kind == "fireworks":
+                rows = await _fetch_fireworks_catalog(client, provider)
+                response = None
+            else:
+                response = None
+            if provider.kind == "openrouter":
+                # OpenRouter's models catalog is public and therefore cannot
+                # validate a bearer token. Its key endpoint is authenticated.
+                key_response = await client.get(
+                    f"{provider.base_url.rstrip('/')}/key",
+                    headers=_provider_headers(provider),
+                    timeout=10.0,
+                )
+                if key_response.status_code >= 400:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=_provider_error_detail(key_response),
+                    )
+            if provider.kind != "fireworks":
+                response = await client.get(
+                    f"{provider.base_url.rstrip('/')}/models",
+                    headers=_provider_headers(provider),
+                    timeout=10.0,
+                )
+    except httpx.RequestError as exc:
+        raise HTTPException(status_code=400, detail=f"Could not reach {provider.name}.") from exc
+    if response is not None and response.status_code >= 400:
+        raise HTTPException(
+            status_code=400,
+            detail=_provider_error_detail(response, models_endpoint=True),
+        )
+    if response is not None:
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="The models endpoint returned invalid JSON.") from exc
+        if isinstance(payload, list):
+            rows = payload
+        elif isinstance(payload, dict):
+            rows = payload.get("data") or payload.get("models") or []
+        else:
+            rows = []
+
+    normalized_rows: list[dict] = []
+    for raw_row in rows:
+        if not isinstance(raw_row, dict):
+            continue
+        row = dict(raw_row)
+        model_id = str(row.get("id") or row.get("name") or "")
+        if provider.kind == "google" and model_id.startswith("models/"):
+            model_id = model_id.removeprefix("models/")
+        if not model_id:
+            continue
+        row["id"] = model_id
+        row["name"] = str(
+            row.get("display_name")
+            or row.get("displayName")
+            or row.get("name")
+            or model_id
+        )
+        if provider.kind == "fireworks" and row.get("contextLength"):
+            row["context_length"] = row["contextLength"]
+        normalized_rows.append(row)
+    return normalized_rows
+
+
+async def _profile_provider_model(
+    provider: LLMProviderConfig,
+    model: LLMProviderModelConfig,
+) -> dict:
+    from routes.settings import LLMScenarioResult, _profile_endpoint
+
+    config = LLMEndpointConfig(
+        url=provider.base_url,
+        model=model.model_id,
+        api_key=provider.api_key,
+        # A full remote context probe can consume tens of thousands of paid
+        # tokens. Authenticated remote catalogs supply context while behavioral
+        # probes stay deliberately small.
+        max_context_tokens=(
+            min(model.max_context_tokens, 8192)
+            if provider.kind in {"openrouter", "together", "fireworks"}
+            else model.max_context_tokens
+        ),
+        content_policy_enabled=False,
+    )
+    scenarios, detected = await _profile_endpoint(config)
+    if provider.kind in {"openrouter", "together", "fireworks"}:
+        scenarios["context"] = LLMScenarioResult(
+            passed=True,
+            detail=f"Provider reports {model.max_context_tokens:,} tokens",
+        )
+    _apply_local_profile(model, scenarios, detected, provider.kind)
+    if provider.kind in {"local", "together", "fireworks"} and model.reasoning.mode == "none":
+        scenarios["thinking"] = LLMScenarioResult(
+            passed=False,
+            error="Reasoning is required.",
+        )
+    results = {name: result.model_dump() for name, result in scenarios.items()}
+    model.last_test_results = results
+    model.last_tested_at = datetime.now(timezone.utc).isoformat()
+    failed = [
+        scenario for scenario in REQUIRED_MODEL_PROFILE_SCENARIOS
+        if not scenarios.get(scenario) or not scenarios[scenario].passed
+    ]
+    model.last_test_passed = not failed
+    required_errors = {
+        "vision": "Vision is required.",
+        "tools": "Tools are required.",
+        "thinking": "Reasoning is required.",
+    }
+    first_failure = scenarios.get(failed[0]) if failed else None
+    model.last_error = None if not failed else required_errors.get(failed[0]) or (
+        first_failure.error
+        if first_failure and first_failure.error
+        else f"{failed[0].capitalize()} test failed."
+    )
+    return results
+
+
+async def _test_local_provider_model(
+    provider: LLMProviderConfig,
+    model: LLMProviderModelConfig,
+) -> dict:
+    results = await _profile_provider_model(provider, model)
+    if not model.last_test_passed:
+        raise HTTPException(status_code=400, detail=model.last_error)
+    return results
+
+
+@router.get("/providers")
+async def list_llm_providers():
+    return {"providers": [_provider_response(provider) for provider in _active_providers()]}
+
+
+@router.post("/providers/discover")
+async def preview_llm_provider_models(request: ProviderCreateRequest):
+    provider, rows = await _preview_provider(request)
+    rows = _selectable_provider_rows(provider, rows)
+    return {
+        "provider_name": provider.name,
+        "models": [
+            {
+                "id": str(row.get("id") or row.get("name")),
+                "name": str(row.get("name") or row.get("id")),
+                "context_length": row.get("context_length"),
+            }
+            for row in rows
+        ],
+    }
+
+
+@router.post("/providers")
+async def create_llm_provider(request: ProviderCreateRequest):
+    if request.kind not in PROVIDER_DEFAULTS:
+        raise HTTPException(status_code=400, detail="Unsupported provider type.")
+    defaults = PROVIDER_DEFAULTS[request.kind]
+    provider_id = f"{request.kind}-{uuid4().hex[:10]}"
+    provider = LLMProviderConfig(
+        id=provider_id,
+        kind=request.kind,
+        name=(request.name or defaults["name"]).strip(),
+        base_url=(request.base_url or defaults["base_url"]).strip().rstrip("/"),
+        api_key=request.api_key or None,
+    )
+    if request.kind == "local" and not request.name:
+        provider.name = urlparse(provider.base_url).netloc or "Local endpoint"
+    if request.kind != "local" and not provider.api_key:
+        raise HTTPException(status_code=400, detail="API key is required.")
+
+    discovered = await _discover_provider_models(provider)
+    raw_discovered_by_id = {
+        str(row.get("id") or row.get("name")): row for row in discovered
+    }
+    discovered = _selectable_provider_rows(provider, discovered)
+    discovered_by_id = {str(row.get("id") or row.get("name")): row for row in discovered}
+    if request.kind in FIXED_MODEL_PROVIDERS:
+        provider.models = branded_models(request.kind, provider.id)
+        missing = [model.model_id for model in provider.models if model.model_id not in discovered_by_id]
+        if missing:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Provider does not offer: {', '.join(missing)}.",
+            )
+    else:
+        selected = request.model_ids if request.model_ids is not None else (
+            [next(iter(discovered_by_id))] if len(discovered_by_id) == 1 else []
+        )
+        incompatible = [
+            model_id for model_id in selected
+            if model_id in raw_discovered_by_id and model_id not in discovered_by_id
+        ]
+        if incompatible:
+            _require_provider_capabilities(
+                provider, raw_discovered_by_id[incompatible[0]]
+            )
+        unknown = [model_id for model_id in selected if model_id not in discovered_by_id]
+        if unknown:
+            raise HTTPException(status_code=400, detail=f"Model not found: {unknown[0]}.")
+        provider.models = [
+            discovered_model(
+                provider.id,
+                model_id,
+                name=str(discovered_by_id[model_id].get("name") or model_id),
+            )
+            for model_id in selected
+        ]
+        for model in provider.models:
+            advertised_context = discovered_by_id[model.model_id].get("context_length")
+            if advertised_context:
+                model.max_context_tokens = int(advertised_context)
+        if request.kind in PROFILED_MODEL_PROVIDERS:
+            for model in provider.models:
+                await _test_local_provider_model(provider, model)
+                if request.kind == "openrouter":
+                    _apply_openrouter_reasoning_metadata(
+                        model, discovered_by_id[model.model_id]
+                    )
+    provider.last_tested_at = datetime.now(timezone.utc).isoformat()
+    provider.last_test_passed = True
+    if provider.kind != "local":
+        provider.credentials_validated_at = provider.last_tested_at
+    providers = list(get_settings().llm_providers)
+    providers.append(provider)
+    _save_providers(providers)
+    return _provider_response(provider)
+
+
+def _find_provider(provider_id: str) -> tuple[list[LLMProviderConfig], LLMProviderConfig]:
+    providers = list(get_settings().llm_providers)
+    for provider in providers:
+        if provider.id == provider_id and not provider.deleted_at:
+            return providers, provider
+    raise HTTPException(status_code=404, detail="Provider not found.")
+
+
+@router.get("/providers/{provider_id}/models")
+async def discover_llm_provider_models(provider_id: str):
+    _, provider = _find_provider(provider_id)
+    rows = await _discover_provider_models(provider)
+    rows = _selectable_provider_rows(provider, rows)
+    selected = {model.model_id for model in provider.models if model.enabled}
+    return {
+        "models": [
+            {
+                "id": str(row.get("id") or row.get("name")),
+                "name": str(row.get("name") or row.get("id")),
+                "selected": str(row.get("id") or row.get("name")) in selected,
+                "context_length": row.get("context_length"),
+            }
+            for row in rows
+        ]
+    }
+
+
+@router.post("/providers/{provider_id}/models/profile")
+async def profile_llm_provider_model(
+    provider_id: str,
+    request: ProviderModelProfileRequest,
+):
+    """Profile one selectable model without adding it to the provider."""
+    _, provider = _find_provider(provider_id)
+    if provider.kind not in PROFILED_MODEL_PROVIDERS:
+        raise HTTPException(status_code=400, detail="This provider has fixed model capabilities.")
+
+    rows = await _discover_provider_models(provider)
+    by_id = {str(row.get("id") or row.get("name")): row for row in rows}
+    advertised = by_id.get(request.model_id)
+    if not advertised:
+        raise HTTPException(status_code=400, detail="Model is no longer available from this provider.")
+    _require_provider_capabilities(provider, advertised)
+
+    existing = next(
+        (model for model in provider.models if model.model_id == request.model_id),
+        None,
+    )
+    model = existing.model_copy(deep=True) if existing else discovered_model(
+        provider.id,
+        request.model_id,
+        name=request.name or str(advertised.get("name") or request.model_id),
+    )
+    advertised_context = advertised.get("context_length")
+    if request.max_context_tokens:
+        model.max_context_tokens = request.max_context_tokens
+    elif advertised_context:
+        model.max_context_tokens = int(advertised_context)
+
+    await _profile_provider_model(provider, model)
+    if provider.kind == "openrouter":
+        _apply_openrouter_reasoning_metadata(model, advertised)
+    return {"model": model.model_dump()}
+
+
+@router.patch("/providers/{provider_id}")
+async def update_llm_provider(provider_id: str, request: ProviderUpdateRequest):
+    providers, provider = _find_provider(provider_id)
+    updates = request.model_dump(exclude_unset=True)
+    if "api_key" in updates and str(updates["api_key"] or "").startswith("***"):
+        updates.pop("api_key")
+    candidate = provider.model_copy(deep=True)
+    for field in ("name", "base_url", "api_key", "enabled"):
+        if field in updates:
+            setattr(candidate, field, updates[field])
+    connection_checked = any(field in updates for field in ("base_url", "api_key"))
+    if connection_checked:
+        discovered = await _discover_provider_models(candidate)
+        advertised_by_id = {
+            str(row.get("id") or row.get("name")): row for row in discovered
+        }
+        advertised = set(advertised_by_id)
+        missing = [model.model_id for model in candidate.models if model.enabled and model.model_id not in advertised]
+        if missing:
+            raise HTTPException(status_code=400, detail=f"Model no longer available: {missing[0]}.")
+        if candidate.kind in {"openrouter", "together", "fireworks"}:
+            for model in candidate.models:
+                if model.enabled:
+                    _require_provider_capabilities(
+                        candidate, advertised_by_id[model.model_id]
+                    )
+    for field in ("name", "base_url", "api_key", "enabled"):
+        if field in updates:
+            setattr(provider, field, getattr(candidate, field))
+    if connection_checked:
+        provider.last_tested_at = datetime.now(timezone.utc).isoformat()
+        provider.last_test_passed = True
+        provider.last_error = None
+        if provider.kind != "local":
+            provider.credentials_validated_at = provider.last_tested_at
+    if request.models is not None:
+        provider.models = _validated_models(provider, request.models)
+    elif request.model_ids is not None:
+        rows = await _discover_provider_models(provider)
+        by_id = {str(row.get("id") or row.get("name")): row for row in rows}
+        unknown = [model_id for model_id in request.model_ids if model_id not in by_id]
+        if unknown:
+            raise HTTPException(status_code=400, detail=f"Model not found: {unknown[0]}.")
+        if provider.kind in {"openrouter", "together", "fireworks"}:
+            for model_id in request.model_ids:
+                _require_provider_capabilities(provider, by_id[model_id])
+        existing = {model.model_id: model for model in provider.models}
+        provider.models = [
+            existing.get(model_id) or discovered_model(
+                provider.id, model_id, name=str(by_id[model_id].get("name") or model_id)
+            )
+            for model_id in request.model_ids
+        ]
+    _save_providers(providers)
+    return _provider_response(provider)
+
+
+@router.post("/providers/{provider_id}/test")
+async def test_llm_provider(provider_id: str):
+    providers, provider = _find_provider(provider_id)
+    try:
+        rows = await _discover_provider_models(provider)
+        advertised_by_id = {str(row.get("id") or row.get("name")): row for row in rows}
+        advertised = set(advertised_by_id)
+        missing = [model.model_id for model in provider.models if model.enabled and model.model_id not in advertised]
+        if missing:
+            raise HTTPException(status_code=400, detail=f"Model no longer available: {missing[0]}.")
+        if provider.kind in {"openrouter", "together", "fireworks"}:
+            for model in provider.models:
+                if model.enabled:
+                    _require_provider_capabilities(
+                        provider, advertised_by_id[model.model_id]
+                    )
+        model_checks = {}
+        if provider.kind == "local":
+            for model in provider.models:
+                if not model.enabled:
+                    continue
+                model_checks[model.model_id] = await _test_local_provider_model(provider, model)
+        provider.last_test_passed = True
+        provider.last_error = None
+    except HTTPException as exc:
+        provider.last_test_passed = False
+        provider.last_error = str(exc.detail)
+        provider.last_tested_at = datetime.now(timezone.utc).isoformat()
+        _save_providers(providers)
+        raise
+    provider.last_tested_at = datetime.now(timezone.utc).isoformat()
+    if provider.kind != "local":
+        provider.credentials_validated_at = provider.last_tested_at
+    _save_providers(providers)
+    return {
+        "status": "ready",
+        "model_count": len(rows),
+        "tested_at": provider.last_tested_at,
+        "model_checks": model_checks,
+    }
+
+
+@router.delete("/providers/{provider_id}")
+async def delete_llm_provider(provider_id: str):
+    providers, provider = _find_provider(provider_id)
+    provider.deleted_at = datetime.now(timezone.utc).isoformat()
+    provider.enabled = False
+    _save_providers(providers)
+    return {"status": "deleted"}
+
+
+def _fallback_provider_model_entry(models: list[dict], lockdown: bool) -> Optional[dict]:
+    """First available provider model — the resolver's last-resort fallback."""
+    return next(
+        (
+            m for m in models
+            if m.get("source") == "provider" and m.get("available")
+            and (not lockdown or m.get("provider_kind") == "local")
+        ),
+        None,
+    )
+
+
+@router.get("/available")
+async def get_available_models(project_id: Optional[int] = Query(None)):
+    """Get available models for the chat model picker.
+
+    Merges Stimma Cloud catalog with locally configured endpoints.
+    Optionally includes project-level default when project_id is provided.
+    """
+    models = []
+    settings = get_settings()
+    lockdown = is_privacy_lockdown_enabled()
+    cloud_status = "privacy_lockdown" if lockdown else "not_logged_in"
+    cloud_message = "" if lockdown else "Sign in to your Stimma account to use hosted models."
+    cloud_entries = []
+    cloud_authenticated = False
+
+    # 1. Fetch cloud catalog if authenticated
+    try:
+        from firebase_auth import get_valid_id_token
+        id_token = None if lockdown else await get_valid_id_token()
+        cloud_authenticated = bool(id_token)
+        if id_token:
+            cloud_status = "cloud_unreachable"
+            cloud_message = "Stimma cannot be reached."
+            base_url = settings.cloud.base_url
+            url = f"{base_url}/api/llm/v1/models"
+            async with httpx.AsyncClient() as client:
+                response = await client.get(
+                    url,
+                    headers=with_cloud_access_headers({"Authorization": f"Bearer {id_token}"}),
+                    timeout=10.0,
+                )
+                if response.status_code == 200:
+                    data = response.json()
+                    cloud_entries = data.get('data', [])
+                    cloud_status = "available"
+                    cloud_message = ""
+                    # Update resolver cache
+                    set_catalog_cache(cloud_entries)
+                    for entry in cloud_entries:
+                        models.append({
+                            "slug": entry["slug"],
+                            "source": "stimma_cloud",
+                            "name": entry["name"],
+                            "description": entry.get("description", ""),
+                            "based_on": entry.get("based_on"),
+                            "available": True,
+                            "status": "available",
+                            "max_context_tokens": get_max_context_tokens(entry["slug"]),
+                            "provider_id": "stimma",
+                            "provider_name": entry.get("provider_name", "Stimma"),
+                            "model_vendor": entry.get("model_vendor"),
+                            "upstream_provider": entry.get("upstream_provider"),
+                            "canonical_model_id": entry.get("canonical_model_id"),
+                            "reasoning": entry.get("reasoning"),
+                            "cost_tier": entry.get("cost_tier"),
+                            "supports_tools": entry.get("supports_tools", True),
+                            "input_modalities": entry.get("input_modalities", ["text"]),
+                            "is_default": entry.get("is_default", False),
+                        })
+                elif response.status_code in (401, 403):
+                    cloud_status = "subscription_required"
+                    cloud_message = "Your Stimma account does not currently include hosted models."
+    except Exception as e:
+        log.warning("failed to fetch cloud model catalog", error=str(e))
+
+    # The fallback names are compiled into the app; they do not come from a
+    # network request. Even so, Cloud models should be absent—not advertised as
+    # unavailable—while Privacy Lockdown is active.
+    if cloud_authenticated and not cloud_entries and not lockdown:
+        for slug in PUBLIC_CLOUD_FALLBACK_MODELS:
+            models.append({
+                "slug": slug,
+                "source": "stimma_cloud",
+                "name": PUBLIC_CLOUD_FALLBACK_MODELS[slug],
+                "description": cloud_message,
+                "available": False,
+                "status": cloud_status,
+                "max_context_tokens": get_max_context_tokens(slug),
+            })
+
+    # 2. Add user-owned providers. Provider-qualified model IDs avoid actual
+    # collisions; canonical IDs let the picker collapse the Stimma route when
+    # the same underlying model is available through the user's own key.
+    user_canonical_ids: dict[str, str] = {}
+    for provider in _active_providers():
+        if not provider.enabled:
+            continue
+        provider_name = _provider_display_name(provider)
+        for provider_model in provider.models:
+            if not provider_model.enabled:
+                continue
+            canonical_id = _canonical_model_id(provider.kind, provider_model.model_id)
+            user_canonical_ids[canonical_id] = provider_name
+            models.append({
+                "slug": provider_model.id,
+                "source": "provider",
+                "provider_id": provider.id,
+                "provider_name": provider_name,
+                "provider_kind": provider.kind,
+                "model_vendor": provider_model.model_vendor,
+                "canonical_model_id": canonical_id,
+                "name": provider_model.name,
+                "description": f"via {provider_name}",
+                "available": provider.last_test_passed is not False,
+                "status": "available" if provider.last_test_passed is not False else "provider_unavailable",
+                "max_context_tokens": min(256_000, provider_model.max_context_tokens),
+                "reasoning": provider_model.reasoning.model_dump(),
+                "supports_tools": provider_model.supports_tools,
+                "input_modalities": provider_model.input_modalities,
+            })
+    for model in models:
+        if model.get("source") != "stimma_cloud":
+            continue
+        canonical_id = model.get("canonical_model_id")
+        if canonical_id and canonical_id in user_canonical_ids:
+            model["collapsed"] = True
+            model["shadowed_by_provider"] = user_canonical_ids[canonical_id]
+
+    # 3. Keep the legacy endpoint pair available until it is migrated into a
+    # provider. New local servers are represented independently above.
+    agent_config = settings.llms.get('agent')
+    agent_fast_config = settings.llms.get('agent-fast')
+    agent_has_endpoint = (
+        agent_config and agent_config.endpoint and agent_config.endpoint.url
+    )
+    agent_fast_has_endpoint = (
+        agent_fast_config and agent_fast_config.endpoint and agent_fast_config.endpoint.url
+    )
+
+    if agent_has_endpoint and agent_fast_has_endpoint:
+        # Both endpoints configured — offer as a selectable pair
+        agent_model = agent_config.endpoint.model or "custom"
+        local_max_context_tokens = agent_config.endpoint.max_context_tokens
+        models.append({
+            "slug": "local",
+            "source": "endpoint",
+            "name": agent_model,
+            # Kept for tooltips and non-picker consumers; the picker renders
+            # endpoint_url/endpoint_model as separate truncated lines.
+            "description": f"{agent_config.endpoint.url} ({agent_model})",
+            "endpoint_url": agent_config.endpoint.url,
+            "endpoint_model": agent_model,
+            "available": True,
+            "status": "available",
+            "max_context_tokens": local_max_context_tokens,
+            "supports_tools": agent_config.endpoint.supports_tools,
+            "input_modalities": agent_config.endpoint.input_modalities,
+        })
+    else:
+        local_max_context_tokens = 128_000
+        models.append({
+            "slug": "local",
+            "source": "endpoint",
+            "name": "Local model endpoint",
+            "description": "Add a model endpoint in Settings > Chat Models.",
+            "available": False,
+            "status": "local_missing",
+            "max_context_tokens": local_max_context_tokens,
+        })
+
+    auto_model = {
+        "slug": "auto",
+        "source": "auto",
+        "name": "Set up a local model" if lockdown else "Set up AI models",
+        "description": (
+            "Add a model endpoint in Settings > Chat Models."
+            if lockdown
+            else "Add a model provider or sign in to your Stimma account."
+        ),
+        "available": False,
+        "status": "llm_not_configured",
+        "resolved_slug": None,
+        "max_context_tokens": get_max_context_tokens('stimma:minimax-m3'),
+    }
+    # What `auto` means for a chat has to come from the resolver, not from a
+    # hardcoded slug: the picker showing one model while Settings and the
+    # actual call use another is worse than showing nothing.
+    auto_chat_slug = await resolve_auto_slug("chat")
+    auto_chat_entry = next(
+        (m for m in models if m.get("slug") == auto_chat_slug and m.get("available")),
+        None,
+    )
+    if auto_chat_entry:
+        auto_model.update({
+            "name": f"Auto: {auto_chat_entry['name']}",
+            "description": auto_chat_entry.get("description", ""),
+            "available": True,
+            "status": "available",
+            "resolved_slug": auto_chat_slug,
+            "max_context_tokens": auto_chat_entry.get(
+                "max_context_tokens", get_max_context_tokens(auto_chat_slug)
+            ),
+        })
+    elif agent_has_endpoint and agent_fast_has_endpoint:
+        auto_model.update({
+            "name": f"Auto: {agent_model}",
+            "description": "Uses your configured model endpoint.",
+            "available": True,
+            "status": "available",
+            "resolved_slug": "local",
+            "max_context_tokens": local_max_context_tokens,
+        })
+    else:
+        # Mirror the resolver's last-resort fallback: with no cloud and no
+        # legacy endpoint pair, 'auto' uses the first working provider model
+        # so one configured model never needs an explicit selection.
+        fallback = _fallback_provider_model_entry(models, lockdown)
+        if fallback:
+            auto_model.update({
+                "name": f"Auto: {fallback['name']}",
+                "description": f"Uses {fallback['name']} via {fallback['provider_name']}.",
+                "available": True,
+                "status": "available",
+                "resolved_slug": fallback["slug"],
+                "max_context_tokens": fallback["max_context_tokens"],
+            })
+
+    # Acceptance lane: the resolver (_acceptance_llm_config) serves a
+    # deterministic in-process LLM for every role regardless of cloud auth or
+    # local endpoint config, so the picker must advertise `auto` as available.
+    # Otherwise the model list loads as "unavailable" and the composer silently
+    # no-ops sends — a race the acceptance chat tests only win by sending before
+    # /models/available resolves.
+    if os.environ.get("STIMMA_TEST_PROVIDER"):
+        cloud_status = "available"
+        cloud_message = ""
+        auto_model.update({
+            "name": "Auto: Acceptance LLM",
+            "description": "Deterministic in-process model used by the acceptance lane.",
+            "available": True,
+            "status": "available",
+            "resolved_slug": "auto",
+            "max_context_tokens": get_max_context_tokens('stimma:minimax-m3'),
+        })
+
+    models.insert(0, auto_model)
+
+    # 4. Resolve every role: project override -> profile setting -> auto.
+    project_overrides: dict[str, Optional[str]] = {role: None for role in SETTINGS_ROLES}
+    project_efforts: dict[str, Optional[str]] = {role: None for role in SETTINGS_ROLES}
+    if project_id is not None:
+        try:
+            from core.profile_context import get_current_profile
+            from database_registry import get_database_registry
+            from database import Project
+            from sqlalchemy import select
+
+            db = get_database_registry().get_database(get_current_profile())
+            async with db.async_session_maker() as session:
+                result = await session.execute(
+                    select(*(
+                        [getattr(Project, PROJECT_ROLE_COLUMNS[r]) for r in SETTINGS_ROLES]
+                        + [getattr(Project, PROJECT_EFFORT_COLUMNS[r]) for r in SETTINGS_ROLES]
+                    )).where(
+                        Project.id == project_id,
+                        Project.deleted_at.is_(None),
+                    )
+                )
+                row = result.first()
+                if row:
+                    n = len(SETTINGS_ROLES)
+                    project_overrides = dict(zip(SETTINGS_ROLES, row[:n]))
+                    project_efforts = dict(zip(SETTINGS_ROLES, row[n:]))
+        except Exception as e:
+            log.warning("failed to fetch project model overrides", error=str(e))
+
+    def _lockdown_safe(slug: Optional[str]) -> Optional[str]:
+        # A saved cloud slug can't be honored during lockdown; show it as auto,
+        # matching what resolve_chat_model_slug will actually do.
+        if lockdown and slug not in {None, "auto", "local"}:
+            return "auto"
+        return slug
+
+    def _reasoning_for(slug: Optional[str], catalog: list) -> dict:
+        entry = next((m for m in catalog if m.get("slug") == slug), None)
+        return (entry or {}).get("reasoning") or {}
+
+    def _block(role: str, slug: Optional[str], pinned_effort: Optional[str]) -> dict:
+        """One resolution outcome: the model, the level, and that model's ladder.
+
+        The client renders straight from these, so switching a row (or resetting
+        the section) can repaint immediately instead of waiting on a round trip
+        and visibly flipping from the old value to the new one.
+        """
+        reasoning = _reasoning_for(slug, models)
+        levels = reasoning.get("levels") or []
+        effort = pinned_effort if pinned_effort in levels else seed_effort(
+            role, levels, reasoning.get("default"), reasoning.get("quick_task")
+        )
+        return {"model": slug, "effort": effort, "levels": levels}
+
+    role_defaults = {}
+    for role in SETTINGS_ROLES:
+        profile_setting = _lockdown_safe(
+            normalize_model_slug(settings.get_role_model_slug(role))
+        )
+        override = _lockdown_safe(normalize_model_slug(project_overrides.get(role)))
+        profile_effort = settings.get_role_effort(role)
+        project_effort = project_efforts.get(role)
+
+        resolved_for_role = await resolve_role_model_slug(
+            role, project_slug=override,
+        ) if override else await resolve_role_model_slug(role)
+
+        role_defaults[role] = {
+            "profile": profile_setting or "auto",
+            "project": override,
+            # In effect right now, given whatever is saved.
+            "resolved": _block(role, resolved_for_role, project_effort or profile_effort),
+            # What this role falls to with nothing saved at all — what a reset
+            # lands on, so the client can show it without asking again.
+            "auto": _block(role, await resolve_auto_slug(role), None),
+            # What the profile resolves to, ignoring any project override —
+            # what a project row inherits.
+            "inherited": _block(
+                role, await resolve_role_model_slug(role), profile_effort
+            ),
+        }
+
+    # The chat role keeps its own top-level keys — the model picker and several
+    # older consumers read them by name.
+    effective_global_default = role_defaults["chat"]["profile"]
+    effective_project_default = role_defaults["chat"]["project"]
+
+    saved_slugs = {
+        slug
+        for entry in role_defaults.values()
+        for slug in (entry["profile"], entry["project"])
+        if slug and slug not in {m["slug"] for m in models}
+    }
+    for slug in saved_slugs:
+        models.append({
+            "slug": slug,
+            "source": "stimma_cloud" if slug != "local" else "endpoint",
+            "name": f"Unknown model: {slug}",
+            "description": "This saved model is no longer available.",
+            "available": False,
+            "status": "model_missing",
+            "max_context_tokens": get_max_context_tokens(slug),
+        })
+
+    return {
+        "models": models,
+        "global_default": effective_global_default,
+        "role_defaults": role_defaults,
+        "reasoning_levels": getattr(settings, "llm_reasoning_levels", {}),
+        "project_default": effective_project_default,
+        "cloud_status": cloud_status,
+        "cloud_message": cloud_message,
+    }

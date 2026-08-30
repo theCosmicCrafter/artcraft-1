@@ -51,6 +51,9 @@
     },
     {
       "path": "../common/tsconfig.lib.json"
+    },
+    {
+      "path": "../tauri-api/tsconfig.lib.json"
     }
   ]
 }

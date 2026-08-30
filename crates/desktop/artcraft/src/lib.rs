@@ -6,6 +6,8 @@ use tauri::Manager;
 
 use crate::core::commands::app_preferences::get_app_preferences_command::get_app_preferences_command;
 use crate::core::commands::app_preferences::update_app_preference_command::update_app_preferences_command;
+use crate::core::commands::companion::companion_restart_command::companion_restart_command;
+use crate::core::commands::companion::companion_status_command::companion_status_command;
 use crate::core::commands::cost_estimate::estimate_image_cost_command::estimate_image_cost_command;
 use crate::core::commands::cost_estimate::estimate_splat_cost_command::estimate_splat_cost_command;
 use crate::core::commands::cost_estimate::estimate_video_cost_command::estimate_video_cost_command;
@@ -37,6 +39,8 @@ use crate::core::lifecycle::startup::setup_main_window::setup_main_window;
 use crate::core::state::app_env_configs::app_env_configs::AppEnvConfigs;
 use crate::core::state::app_preferences::app_preferences_manager::load_app_preferences_or_default;
 use crate::core::state::artcraft_platform_info::ArtcraftPlatformInfo;
+use crate::core::state::companion::companion_restart_signal::CompanionRestartSignal;
+use crate::core::state::companion::companion_state::CompanionState;
 use crate::core::state::data_dir::app_data_root::AppDataRoot;
 use crate::core::state::provider_priority::ProviderPriorityStore;
 use crate::core::threads::discord_presence_thread::discord_presence_thread;
@@ -139,6 +143,12 @@ pub fn run() {
   let artcraft_usage_tracker = ArtcraftUsageTracker::new();
   let artcraft_usage_tracker_2 = artcraft_usage_tracker.clone();
 
+  let companion_state = CompanionState::empty();
+  let companion_state_2 = companion_state.clone();
+
+  let companion_restart_signal = CompanionRestartSignal::new();
+  let companion_restart_signal_2 = companion_restart_signal.clone();
+
   println!("Initializing backend runtime...");
 
   let builder = tauri::Builder::default()
@@ -164,6 +174,8 @@ pub fn run() {
       let storyteller_creds = storyteller_creds_manager_2.clone();
       let sora_creds = sora_creds_manager_2.clone();
       let sora_tasks = sora_task_queue_2.clone();
+      let companion = companion_state_2.clone();
+      let companion_restart = companion_restart_signal_2.clone();
 
       tauri::async_runtime::block_on(async move {
         let result = setup_main_window(&app).await;
@@ -183,6 +195,8 @@ pub fn run() {
           worldlabs_bearer_bridge_2,
           worldlabs_creds_manager_2,
           provider_credential_cache_2,
+          companion,
+          companion_restart,
         ).await;
 
         if let Err(err) = result {
@@ -198,6 +212,8 @@ pub fn run() {
     .manage(app_preferences)
     .manage(artcraft_platform_info)
     .manage(artcraft_usage_tracker)
+    .manage(companion_state)
+    .manage(companion_restart_signal)
     .manage(grok_creds_manager)
     .manage(grok_prompt_queue)
     .manage(midjourney_creds_manager)
@@ -212,6 +228,8 @@ pub fn run() {
   //  My first attempt at naively doing this didn't work because the macros can't find their codegen'd targets.
   let builder = builder.invoke_handler(tauri::generate_handler![
     check_sora_session_command,
+    companion_restart_command,
+    companion_status_command,
     download_directory_reveal_command,
     download_media_file_command,
     download_url_command,

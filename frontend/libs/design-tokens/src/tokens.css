@@ -1,0 +1,90 @@
+/*
+ * ArtCraft Studio shared design tokens.
+ *
+ * Implements exactly the token set proposed in _docs/pagedraw_design_review.md
+ * §6 (Appendix) — the review's top P0 finding was that pagedraw both (a)
+ * reaches for host tokens (bg-ui-panel, text-base-fg) AND (b) hardcodes its
+ * own greys, so it can never be fully reskinned. This file is the fix: one
+ * canonical source new UI (medialibrary/, agentcopilot/, flows/, darkroom/ —
+ * see UI_UX_PLAN.md) consumes from day one, and pagedraw/pagescene can
+ * retrofit onto later.
+ *
+ * `--st-*` prefix ("studio tokens") deliberately distinct from shadcn's own
+ * `--primary`/`--background`/etc. (used by apps/artcraft-dashboard and
+ * apps/genhub, see their src/styles.css) so this file composes with either:
+ *   - Hosts that already define shadcn tokens: `--st-accent` resolves through
+ *     `var(--primary)` as the review specifies.
+ *   - Hosts that don't yet (apps/artcraft, the legacy Tauri shell UI_UX_PLAN.md
+ *     names as where new Studio surfaces mount first — it has no shadcn tokens
+ *     today): the `@layer base` block below defines minimal shadcn-compatible
+ *     fallbacks so `--st-accent` never resolves to nothing. A host that later
+ *     adopts full shadcn simply overrides `--primary` etc. and these fallbacks
+ *     stop mattering — no conflict either way.
+ *
+ * Usage: `@import "@storyteller/design-tokens/tokens.css";` once per host app
+ * (not per-library — these are global custom properties, importing them
+ * repeatedly is harmless but unnecessary).
+ */
+
+@layer base {
+  :root {
+    /* Minimal shadcn-compatible fallbacks - see file header. Hosts that
+       already define these (apps/artcraft-dashboard, apps/genhub) simply
+       override; this block never conflicts, it only fills a gap. */
+    --primary: oklch(0.205 0 0);
+    --primary-foreground: oklch(0.985 0 0);
+    --background: oklch(1 0 0);
+    --foreground: oklch(0.145 0 0);
+  }
+
+  .dark {
+    --primary: oklch(0.922 0 0);
+    --primary-foreground: oklch(0.205 0 0);
+    --background: oklch(0.175 0 0);
+    --foreground: oklch(0.985 0 0);
+  }
+}
+
+:root {
+  /* ── Canvas + chrome surface ramp ── */
+  /* Light theme: a slightly-off-white working surface, not pure white -
+     keeps media/generated-content thumbnails from reading as "floating on
+     paper" the way #fff canvases do. */
+  --st-canvas: oklch(0.97 0 0);
+  --st-accent: var(--primary);
+  --st-hairline: rgb(0 0 0 / 0.08);
+  --st-inset-hi: inset 0 1px 0 rgb(255 255 255 / 0.6);
+
+  /* ── Motion ── */
+  --st-ease: cubic-bezier(0.32, 0.72, 0, 1);
+  --st-dur-fast: 180ms;
+  --st-dur: 300ms;
+
+  /* ── Radius scale (concentric — each step nests cleanly inside the last) ── */
+  --st-r-shell: 1.25rem; /* rounded-2xl equivalent */
+  --st-r-card: 0.875rem; /* rounded-xl equivalent */
+  --st-r-control: 0.5rem; /* rounded-lg equivalent */
+}
+
+.dark {
+  /* Dark theme: replaces pagedraw's hardcoded #1b1b1b "pegboard" background
+     (_docs/pagedraw_design_review.md §1, Color system finding) with a token
+     hosts can actually theme. */
+  --st-canvas: oklch(0.145 0 0);
+  --st-hairline: rgb(255 255 255 / 0.1);
+  --st-inset-hi: inset 0 1px 0 rgb(255 255 255 / 0.08);
+}
+
+/*
+ * Tailwind v4 (`@theme inline`) mapping, for hosts using Tailwind utility
+ * classes against these tokens (e.g. `bg-st-canvas`, `rounded-st-card`)
+ * rather than raw `var(--st-*)` in component CSS. Both styles work; this
+ * block just wires the utility-class sugar for hosts that want it.
+ */
+@theme inline {
+  --color-st-canvas: var(--st-canvas);
+  --color-st-accent: var(--st-accent);
+  --radius-st-shell: var(--st-r-shell);
+  --radius-st-card: var(--st-r-card);
+  --radius-st-control: var(--st-r-control);
+}

@@ -217,6 +217,53 @@ jobs:
           fi
 
 
+      - name: Provision embeddable Python for the Companion
+        # Must run before "build and publish" below - see the equivalent
+        # step's header comment in artcraft-windows-publish.yml for the
+        # full rationale (bundle.resources needs companion/python*/ to
+        # exist on disk before `tauri build` runs).
+        #
+        # This build target is `universal-apple-darwin` (see this job's
+        # matrix above) - one fat binary covering both arm64 and x86_64,
+        # resolved by the OS loader at launch time based on the actual
+        # running CPU. A bundled Python resource doesn't get "universalized"
+        # the same way (it's just files, not a Mach-O the loader merges) -
+        # an x86_64-only interpreter would still run under Rosetta 2 on
+        # Apple Silicon, but silently lose native performance for the
+        # CPU-bound ONNX/CLIP inference work this Companion does. So both
+        # architectures are vendored side by side
+        # (companion/python-aarch64/, companion/python-x86_64/) and
+        # companion_launch_config.rs's packaged-mode resolver picks the one
+        # matching `std::env::consts::ARCH` at actual process runtime, not
+        # compile time.
+        #
+        # Not exercised against a real `tauri build` in the session that
+        # wrote this (no tauri/cargo-tauri CLI available there to test
+        # with) - the explicit existence checks below are designed to fail
+        # this job loudly if the archive-layout assumption turns out wrong,
+        # rather than let a broken installer ship silently.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          COMPANION_DIR="${{ github.workspace }}/companion"
+          for spec in "aarch64-apple-darwin:python-aarch64" "x86_64-apple-darwin:python-x86_64"; do
+            TARGET="${spec%%:*}"
+            DEST_NAME="${spec##*:}"
+            gh release download --repo astral-sh/python-build-standalone \
+              --pattern "cpython-3.11.*-${TARGET}-install_only.tar.gz" \
+              --output "python-standalone-${TARGET}.tar.gz" --clobber
+            mkdir -p "$COMPANION_DIR/$DEST_NAME"
+            # Archive's own top-level "python/" directory becomes
+            # companion/<DEST_NAME>/ - strip it during extraction since we
+            # already created the differently-named destination directory.
+            tar -xzf "python-standalone-${TARGET}.tar.gz" -C "$COMPANION_DIR/$DEST_NAME" --strip-components=1
+            if [ ! -x "$COMPANION_DIR/$DEST_NAME/bin/python3" ]; then
+              echo "::error::Expected $COMPANION_DIR/$DEST_NAME/bin/python3 after extracting python-build-standalone for $TARGET - archive layout assumption was wrong, see this step's comment."
+              exit 1
+            fi
+            "$COMPANION_DIR/$DEST_NAME/bin/python3" -m pip install --no-warn-script-location -r "$COMPANION_DIR/requirements.txt"
+          done
+
       - name: build and publish
         uses: tauri-apps/tauri-action@v0
         env:

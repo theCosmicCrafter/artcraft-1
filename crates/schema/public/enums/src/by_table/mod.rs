@@ -1,9 +1,11 @@
 // ===== MySql =====
+pub mod age_verification_attempts;
 pub mod audit_logs;
 pub mod batch_generations;
 pub mod characters;
 pub mod beta_keys;
 pub mod comments;
+pub mod content_policy_violations;
 pub mod debug_logs;
 pub mod email_sender_jobs;
 pub mod entity_stats;

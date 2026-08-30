@@ -6,7 +6,7 @@ use tokens::tokens::mcp_session_refresh::McpSessionRefreshToken;
 
 // ── POST /v1/mcp/session/create ──
 
-#[derive(Deserialize, ToSchema)]
+#[derive(Serialize, Deserialize, ToSchema)]
 pub struct CreateMcpSessionRequest {
   /// Name of the MCP client creating the session, if any.
   pub maybe_mcp_client_name: Option<String>,
@@ -18,7 +18,7 @@ pub struct CreateMcpSessionRequest {
   pub maybe_mcp_client_vendor: Option<String>,
 }
 
-#[derive(Serialize, ToSchema)]
+#[derive(Serialize, Deserialize, ToSchema)]
 pub struct CreateMcpSessionSuccessResponse {
   pub success: bool,
 

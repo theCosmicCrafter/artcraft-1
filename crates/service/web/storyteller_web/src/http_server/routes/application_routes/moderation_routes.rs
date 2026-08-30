@@ -14,6 +14,7 @@ use crate::http_server::deprecated_endpoints::moderation::user_roles::set_user_r
 use crate::http_server::deprecated_endpoints::moderation::users::list_users::list_users_handler;
 use crate::http_server::endpoints::inference_job::admin::kill_inference_jobs_handler::kill_generic_inference_jobs_handler;
 use crate::http_server::endpoints::moderation::info::moderator_token_info_handler::moderator_get_token_info_handler;
+use crate::http_server::endpoints::moderation::content_policy_violations::moderator_list_content_policy_violations_handler::moderator_list_content_policy_violations_handler;
 use crate::http_server::endpoints::moderation::ip_bans::add_ip_ban::add_ip_ban_handler;
 use crate::http_server::endpoints::moderation::ip_bans::delete_ip_ban::delete_ip_ban_handler;
 use crate::http_server::endpoints::moderation::ip_bans::get_ip_ban::get_ip_ban_handler;
@@ -147,6 +148,10 @@ pub fn add_moderator_routes<T, B> (app: App<T>) -> App<T>
         .service(web::resource("/user_feature_flags/user/{username_or_token}")
             .route(web::get().to(moderator_list_user_feature_flags_handler))
             .route(web::post().to(moderator_edit_user_feature_flags_handler))
+            .route(web::head().to(|| HttpResponse::Ok()))
+        )
+        .service(web::resource("/content_policy_violations/user/{username_or_token}")
+            .route(web::get().to(moderator_list_content_policy_violations_handler))
             .route(web::head().to(|| HttpResponse::Ok()))
         )
         .service(web::scope("/users")

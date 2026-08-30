@@ -1,0 +1,5 @@
+# Dev-only tooling for the Companion - NOT part of the runtime bundle.
+# Install alongside requirements.txt: pip install -r requirements.txt -r requirements-dev.txt
+ruff>=0.15
+pytest>=8
+pytest-asyncio

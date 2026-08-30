@@ -1,0 +1,9 @@
+{
+  "name": "@storyteller/design-tokens",
+  "version": "0.0.1",
+  "type": "module",
+  "exports": {
+    "./package.json": "./package.json",
+    "./tokens.css": "./src/tokens.css"
+  }
+}

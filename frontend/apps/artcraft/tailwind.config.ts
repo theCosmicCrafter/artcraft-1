@@ -32,6 +32,33 @@ export default {
         shimmer: "shimmer 2s ease-in-out infinite",
         marquee: "marquee 8s linear infinite paused",
       },
+      // Bridge for @storyteller/design-tokens (see tokens.css). That package
+      // ships a Tailwind v4 `@theme inline` block for its `bg-st-canvas`-style
+      // utility sugar, but this app is still on Tailwind v3, which doesn't
+      // understand `@theme`. These entries wire the same utility class names
+      // to the same `--st-*` custom properties by hand so v3 and v4 hosts
+      // consume one source of truth without components needing to know which
+      // Tailwind version their host is on.
+      colors: {
+        "st-canvas": "var(--st-canvas)",
+        "st-accent": "var(--st-accent)",
+        "st-hairline": "var(--st-hairline)",
+      },
+      borderRadius: {
+        "st-shell": "var(--st-r-shell)",
+        "st-card": "var(--st-r-card)",
+        "st-control": "var(--st-r-control)",
+      },
+      boxShadow: {
+        "st-inset-hi": "var(--st-inset-hi)",
+      },
+      transitionTimingFunction: {
+        st: "var(--st-ease)",
+      },
+      transitionDuration: {
+        "st-fast": "var(--st-dur-fast)",
+        st: "var(--st-dur)",
+      },
     },
     colors: {
       transparent: "transparent",

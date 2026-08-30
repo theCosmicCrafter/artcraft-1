@@ -22,6 +22,7 @@ use strum::EnumIter;
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 #[cfg_attr(test, derive(EnumIter, EnumCount))]
 pub(crate) enum TokenPrefix {
+  AgeVerificationAttempt, // ArtCraft Studio: crates/schema/public/tokens/CLAUDE.md
   AnonymousVisitorTracking, // AVTs are not stored as primary keys in any table, but an index in many tables.
   ApiKey,
   AppSession, // NB: These are generated client-side (!)
@@ -31,6 +32,7 @@ pub(crate) enum TokenPrefix {
   BrowserSessionLog,
   Character,
   Comment,
+  ContentPolicyViolation, // ArtCraft Studio
   DebugLogEvent,
   DownloadJob,
   EmailSenderJob,
@@ -41,6 +43,7 @@ pub(crate) enum TokenPrefix {
   McpSessionPrivate, // The private credential for an MCP session; carries more entropy.
   McpSessionRefresh, // The rotating refresh credential for an MCP session; carries more entropy.
   MediaFile,
+  MediaFileLocalIndexLink, // ArtCraft Studio: links a locally-ingested file to its cloud media_files token
   MediaUpload,
   ModelWeight,
   NewsStory, // NB: aichatbot / sqlite
@@ -118,6 +121,7 @@ pub trait PrefixGenerator {
 impl PrefixGenerator for TokenPrefix {
   fn prefix(self) -> &'static str {
     match self {
+      Self::AgeVerificationAttempt => "agever_",
       Self::AnonymousVisitorTracking => "avt_",
       Self::ApiKey => "api_key_",
       Self::AppSession => "app_session_",
@@ -127,6 +131,7 @@ impl PrefixGenerator for TokenPrefix {
       Self::BrowserSessionLog => "bsl_",
       Self::Character => "character_",
       Self::Comment => "comment_",
+      Self::ContentPolicyViolation => "cpv_",
       Self::DebugLogEvent => "dbg_",
       Self::DownloadJob => "jdown_", // NB: Previously "JGUP:"
       Self::EmailSenderJob => "email_job_",
@@ -137,6 +142,7 @@ impl PrefixGenerator for TokenPrefix {
       Self::McpSessionPrivate => "mcp_session_",
       Self::McpSessionRefresh => "mcp_refresh_",
       Self::MediaFile => "m_",
+      Self::MediaFileLocalIndexLink => "mfll_",
       Self::MediaUpload => "mu_",
       Self::ModelWeight => "weight_",
       Self::NewsStory => "news_story_",

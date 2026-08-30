@@ -41,9 +41,7 @@ pub async fn basic_json_post_request<Req: Serialize, Res: DeserializeOwned>(
       .header("Content-Type", APPLICATION_JSON);
 
   if let Some(creds) = maybe_creds {
-    if let Some(header) = &creds.maybe_as_cookie_header() {
-      request_builder = request_builder.header("Cookie", header);
-    }
+    request_builder = creds.apply_auth(request_builder);
   }
 
   let request_body = serde_json::to_string(&request)
@@ -60,11 +58,11 @@ pub async fn basic_json_post_request<Req: Serialize, Res: DeserializeOwned>(
   let hostname = response.headers().get("x-backend-hostname")
       .and_then(|v| v.to_str().ok())
       .map(|s| s.to_owned());
-  
+
   let build_sha = response.headers().get("x-build-sha")
       .and_then(|v| v.to_str().ok())
       .map(|s| s.to_owned());
-  
+
   debug!("[server] x-backend-hostname: {:?}, x-build-sha: {:?}", hostname, build_sha);
 
   let response = filter_bad_response(response)

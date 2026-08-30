@@ -1,0 +1,847 @@
+"""Post-processing chain executor.
+
+Runs the linear step chain attached to a generation job after the base
+generation completes: base image → step 1 → step 2 → … → final. Each step is
+either an STP tool invocation (via execute_call_tool — the same path the
+agent uses) or a built-in filter applied server-side.
+
+Failure model (MVP): the chain pauses on a failed step, keeps the last good
+media, and can be retried from the failed step. There is no Stop.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import time
+from datetime import datetime
+from typing import Any, Dict, List, Optional
+
+from sqlalchemy import select, update
+
+from core.logging import get_logger
+from core.profile_context import set_current_profile
+from database import MediaItem, PostProcessingChainRun
+from database_registry import get_database_registry
+
+log = get_logger(__name__)
+
+# Generator instance id used for chain-step jobs. The generation-complete
+# trigger seam skips jobs with this id, so a chain never re-triggers itself.
+CHAIN_INSTANCE_ID = "postproc"
+
+_VIDEO_FORMATS = {"mp4", "webm", "mov", "avi", "mkv", "gif"}
+
+# Task types whose input is a video; everything else consumes an image.
+_VIDEO_INPUT_TASKS = {"upscale-video"}
+# Task types whose output is a video.
+_VIDEO_OUTPUT_TASKS = {"image-to-video", "upscale-video"}
+
+# Track in-flight chain tasks so they aren't garbage collected.
+# In-flight chain tasks, keyed by run id so a run can be cancelled by id.
+_running_tasks: dict[int, asyncio.Task] = {}
+
+
+def _filter_accepts(filter_id: Any) -> set[str]:
+    """Media types a built-in filter can process (defaults to both). Mirrors the
+    frontend getChainFilterAccepts / the tool's x-accept-media schema."""
+    from filters.defs import get_filter_def
+    d = get_filter_def(filter_id or "") or {}
+    return set(d.get("accepts") or ["image", "video"])
+
+
+def _step_accepts(step: Dict[str, Any]) -> set[str]:
+    """Media types this step accepts as input. Filters declare their set; tool
+    steps take the single type their task implies — one uniform notion, no
+    media-agnostic special case."""
+    if step.get("kind") == "filter":
+        return _filter_accepts(step.get("filter_id"))
+    return {"video" if step.get("task_type") in _VIDEO_INPUT_TASKS else "image"}
+
+
+def _step_output_type(step: Dict[str, Any]) -> str:
+    # Filters preserve the running media type (handled by the caller); this only
+    # covers tool steps that transition image<->video.
+    return "video" if step.get("task_type") in _VIDEO_OUTPUT_TASKS else "image"
+
+
+def _step_label(step: Dict[str, Any]) -> str:
+    if step.get("kind") == "filter":
+        return step.get("filter_id") or "filter"
+    return step.get("tool_name") or step.get("tool_id") or "tool"
+
+
+def _step_type(step: Dict[str, Any]) -> str:
+    """The step's taskType for telemetry (in-app filter steps are 'filter')."""
+    if step.get("kind") == "filter":
+        return "filter"
+    return step.get("task_type") or "unknown"
+
+
+async def _load_base_job(db, job_id: int):
+    from database import GenerationJob
+    try:
+        async with db.async_session_maker() as session:
+            result = await session.execute(
+                select(GenerationJob).where(GenerationJob.id == job_id)
+            )
+            return result.scalar_one_or_none()
+    except Exception:
+        return None
+
+
+def _run_duration_ms(run_created_at) -> int:
+    try:
+        return max(0, int((datetime.utcnow() - run_created_at).total_seconds() * 1000))
+    except Exception:
+        return 0
+
+
+async def _generation_time_seconds(db, media_id: int) -> float:
+    """Read a media item's own recorded generation_time (seconds), if any."""
+    async with db.async_session_maker() as session:
+        result = await session.execute(
+            select(MediaItem.generation_metadata).where(MediaItem.id == media_id)
+        )
+        row = result.first()
+    if not row or not row[0]:
+        return 0.0
+    try:
+        meta = json.loads(row[0]) if isinstance(row[0], str) else row[0]
+    except (TypeError, ValueError):
+        return 0.0
+    params = meta.get("parameters") or {}
+    return float(meta.get("generation_time") or params.get("generation_time") or 0.0)
+
+
+async def _apply_chain_total_generation_time(db, media_id: int, total_seconds: float) -> None:
+    """Overwrite the final media's recorded generation_time with the chain
+    total (base generation + every executed post-processing step) so the
+    result-tile badge reflects the whole invocation, not just the last step."""
+    async with db.async_session_maker() as session:
+        result = await session.execute(
+            select(MediaItem.generation_metadata).where(MediaItem.id == media_id)
+        )
+        row = result.first()
+        if not row or not row[0]:
+            return
+        try:
+            meta = json.loads(row[0]) if isinstance(row[0], str) else row[0]
+        except (TypeError, ValueError):
+            return
+        params = meta.setdefault("parameters", {})
+        params["generation_time"] = round(total_seconds, 2)
+        await session.execute(
+            update(MediaItem)
+            .where(MediaItem.id == media_id)
+            .values(generation_metadata=json.dumps(meta))
+        )
+        await session.commit()
+
+
+async def _settle_pipeline_for_run(
+    db,
+    job_id: int,
+    status: str,
+    steps: List[Dict[str, Any]],
+    run_created_at,
+    *,
+    failed_step_index: Optional[int] = None,
+    error_message: Optional[str] = None,
+) -> None:
+    """Settle the base job's generation pipeline when its chain run ends."""
+    try:
+        from pipeline_telemetry import chain_step_tool_refs, emit_pipeline_settled
+        job = await _load_base_job(db, job_id)
+        if job is None:
+            return
+        emit_pipeline_settled(
+            job,
+            status,
+            completed_at=datetime.utcnow(),
+            postprocess_step_count=len(steps),
+            postprocess_duration_ms=_run_duration_ms(run_created_at),
+            postprocess_tool_refs=chain_step_tool_refs(steps),
+            failed_step_index=failed_step_index,
+            error_message=error_message,
+        )
+    except Exception:
+        log.debug("[postproc] pipeline settle telemetry failed", exc_info=True)
+
+
+async def start_chain_for_job(
+    job,
+    base_media_id: int,
+    chain_steps: List[Dict[str, Any]],
+    profile_id: str,
+    websocket_manager,
+) -> Optional[int]:
+    """Create a chain run for a completed base generation and start executing
+    it in the background. Returns the chain_run_id (None if nothing to run)."""
+    steps = [s for s in (chain_steps or []) if isinstance(s, dict)]
+    if not steps:
+        return None
+
+    db = get_database_registry().get_database(profile_id)
+    async with db.async_session_maker() as session:
+        run = PostProcessingChainRun(
+            job_id=job.id,
+            base_media_id=base_media_id,
+            project_id=job.project_id,
+            chain=json.dumps(steps),
+            step_index=0,
+            step_count=len(steps),
+            step_results=json.dumps([{"status": "queued"} for _ in steps]),
+            status="running",
+            last_good_media_id=base_media_id,
+        )
+        session.add(run)
+        await session.commit()
+        await session.refresh(run)
+        run_id = run.id
+
+    log.info(f"[postproc] Job {job.id}: starting chain run {run_id} with {len(steps)} step(s)")
+    _spawn(run_id, profile_id, job.generator_instance_id, websocket_manager)
+    return run_id
+
+
+async def retry_chain_run(chain_run_id: int, profile_id: str, websocket_manager) -> bool:
+    """Resume a paused chain run from its failed step, using the last good
+    media as input. Returns False if the run isn't retryable."""
+    db = get_database_registry().get_database(profile_id)
+    async with db.async_session_maker() as session:
+        result = await session.execute(
+            select(PostProcessingChainRun).where(
+                PostProcessingChainRun.id == chain_run_id,
+                PostProcessingChainRun.deleted_at.is_(None),
+            )
+        )
+        run = result.scalar_one_or_none()
+        if not run or run.status not in ("paused", "failed"):
+            return False
+        # Reset the failed step back to queued and resume.
+        step_results = json.loads(run.step_results or "[]")
+        if run.step_index < len(step_results):
+            step_results[run.step_index] = {"status": "queued"}
+        await session.execute(
+            update(PostProcessingChainRun)
+            .where(PostProcessingChainRun.id == chain_run_id)
+            .values(status="running", error=None, step_results=json.dumps(step_results))
+        )
+        await session.commit()
+        job_instance_id = await _base_job_instance_id(session, run.job_id)
+
+    log.info(f"[postproc] Retrying chain run {chain_run_id} from step {run.step_index}")
+    try:
+        from telemetry import get_telemetry_client
+        get_telemetry_client().track("chain_retried", category="postprocess")
+    except Exception:
+        pass
+    _spawn(chain_run_id, profile_id, job_instance_id, websocket_manager)
+    return True
+
+
+async def reconcile_interrupted_runs(profile_id: str) -> int:
+    """Mark chain runs left 'running' by a previous process as 'paused'.
+
+    A chain run is an in-memory asyncio task; if the backend restarts mid-step
+    the task dies but the row stays 'running' forever — a stuck progress bar
+    with nothing driving it. Run at startup (like cleanup_stale_jobs for jobs)
+    so orphans become paused: they stop reading as in-flight and gain the
+    Retry/Dismiss controls. We deliberately do NOT auto-resume — a step costs
+    compute, so resumption stays an explicit user action."""
+    db = get_database_registry().get_database(profile_id)
+    async with db.async_session_maker() as session:
+        result = await session.execute(
+            update(PostProcessingChainRun)
+            .where(
+                PostProcessingChainRun.status == "running",
+                PostProcessingChainRun.deleted_at.is_(None),
+            )
+            .values(
+                status="paused",
+                error="Interrupted by server restart",
+                updated_at=datetime.utcnow(),
+            )
+        )
+        await session.commit()
+        return result.rowcount or 0
+
+
+async def _base_job_instance_id(session, job_id: int) -> Optional[str]:
+    from database import GenerationJob
+    result = await session.execute(
+        select(GenerationJob.generator_instance_id).where(GenerationJob.id == job_id)
+    )
+    row = result.first()
+    return row[0] if row else None
+
+
+def _spawn(run_id: int, profile_id: str, job_instance_id: Optional[str], websocket_manager) -> None:
+    task = asyncio.create_task(_run_chain(run_id, profile_id, job_instance_id, websocket_manager))
+    _running_tasks[run_id] = task
+    task.add_done_callback(lambda t, rid=run_id: _running_tasks.pop(rid, None))
+
+
+def cancel_chain_run(run_id: int) -> bool:
+    """Cancel a chain run's in-flight task, if one is live in this process.
+
+    Cancelling the task raises CancelledError inside the running step's
+    execute_call_tool, which forwards the interrupt to the provider via
+    cancel_job — the same path normal job cancellation uses. Providers that
+    don't support interruption simply no-op (fire-and-forget). Returns True if
+    a live task was signalled; False if there was nothing running (already
+    done, or orphaned by a restart)."""
+    task = _running_tasks.get(run_id)
+    if task and not task.done():
+        task.cancel()
+        return True
+    return False
+
+
+async def _run_chain(run_id: int, profile_id: str, job_instance_id: Optional[str], websocket_manager) -> None:
+    set_current_profile(profile_id)
+    db = get_database_registry().get_database(profile_id)
+
+    try:
+        async with db.async_session_maker() as session:
+            result = await session.execute(
+                select(PostProcessingChainRun).where(PostProcessingChainRun.id == run_id)
+            )
+            run = result.scalar_one_or_none()
+            if not run:
+                log.error(f"[postproc] Chain run {run_id} not found")
+                return
+            steps: List[Dict[str, Any]] = json.loads(run.chain)
+            step_results: List[Dict[str, Any]] = json.loads(run.step_results or "[]")
+            while len(step_results) < len(steps):
+                step_results.append({"status": "queued"})
+            start_index = run.step_index
+            current_media_id = run.last_good_media_id or run.base_media_id
+            project_id = run.project_id
+            job_id = run.job_id
+            base_media_id = run.base_media_id
+            run_created_at = run.created_at
+
+        from telemetry import get_telemetry_client
+        exec_started = time.perf_counter()
+
+        # Chain-step jobs carry the base pipeline's runId so their tool_*
+        # events join the same generation_pipeline_completed row.
+        base_run_id: Optional[str] = None
+        try:
+            from pipeline_telemetry import run_id_for_job
+            base_job = await _load_base_job(db, job_id)
+            if base_job is not None:
+                base_run_id = run_id_for_job(base_job)
+        except Exception:
+            pass
+
+        def _track_chain_executed(status: str) -> None:
+            try:
+                get_telemetry_client().track("chain_executed", {
+                    "stepCount": len(steps),
+                    "status": status,
+                    "durationMs": int((time.perf_counter() - exec_started) * 1000),
+                }, category="postprocess")
+            except Exception:
+                pass
+
+        current_type = await _media_type(db, current_media_id)
+
+        for idx in range(start_index, len(steps)):
+            step = steps[idx]
+
+            # Media-type transition validation: an incompatible step is
+            # skipped and flagged, not a hard failure (§3.4). A step (tool or
+            # filter) is compatible iff it accepts the type currently flowing.
+            # Most filters accept both, so this never trips for them — a
+            # video-only filter (e.g. reverse) on an image-only chain does.
+            # The check is uniform, not a filter special case.
+            if current_type not in _step_accepts(step):
+                needs = "/".join(sorted(_step_accepts(step)))
+                log.warning(
+                    f"[postproc] Run {run_id} step {idx} ({_step_label(step)}) needs "
+                    f"{needs} input but chain output is {current_type}; skipping"
+                )
+                step_results[idx] = {"status": "skipped_incompatible"}
+                await _save_progress(db, run_id, idx, step_results, "running", current_media_id)
+                await _broadcast(websocket_manager, db, run_id, profile_id, job_instance_id)
+                continue
+
+            step_results[idx] = {"status": "running"}
+            await _save_progress(db, run_id, idx, step_results, "running", current_media_id)
+            await _broadcast(websocket_manager, db, run_id, profile_id, job_instance_id)
+
+            started = time.perf_counter()
+            # Lineage covers only steps that actually executed: prior steps
+            # already marked "done" plus this one (skipped/failed steps never
+            # happened, so they're never recorded — see POSTPROCESSING_CHAINS_PLAN).
+            executed_steps = [
+                steps[i] for i in range(idx) if step_results[i].get("status") == "done"
+            ] + [step]
+            try:
+                # Built-in filters are catalog tools on the lightweight
+                # provider — a filter step is just a tool step spelled
+                # compactly (filter_id ↔ builtin:<filter_id>).
+                if step.get("kind") == "filter":
+                    tool_step = {
+                        "tool_id": f"builtin:{step.get('filter_id')}",
+                        "task_type": "filter",
+                        "settings": step.get("settings"),
+                    }
+                    out_media_id = await _run_tool_step(
+                        db, tool_step, current_media_id, project_id, executed_steps,
+                        run_id=base_run_id, profile_id=profile_id,
+                    )
+                else:
+                    out_media_id = await _run_tool_step(
+                        db, step, current_media_id, project_id, executed_steps,
+                        run_id=base_run_id, profile_id=profile_id,
+                    )
+            except Exception as e:
+                log.error(f"[postproc] Run {run_id} step {idx} ({_step_label(step)}) failed: {e}")
+                step_results[idx] = {
+                    "status": "failed",
+                    "error": str(e),
+                    "duration_ms": int((time.perf_counter() - started) * 1000),
+                }
+                await _save_progress(
+                    db, run_id, idx, step_results, "paused", current_media_id, error=str(e)
+                )
+                await _broadcast(websocket_manager, db, run_id, profile_id, job_instance_id)
+
+                # Telemetry: categorical step failure + chain/pipeline settle.
+                try:
+                    from telemetry_props import classify_tool_error
+                    get_telemetry_client().track("chain_step_failed", {
+                        "stepType": _step_type(step),
+                        "errorType": classify_tool_error(str(e)),
+                    }, category="postprocess")
+                except Exception:
+                    pass
+                _track_chain_executed("failed")
+                await _settle_pipeline_for_run(
+                    db, job_id, "failed", steps, run_created_at,
+                    failed_step_index=idx, error_message=str(e),
+                )
+                return
+
+            duration_ms = int((time.perf_counter() - started) * 1000)
+            step_results[idx] = {
+                "status": "done",
+                "media_id": out_media_id,
+                "duration_ms": duration_ms,
+            }
+            current_media_id = out_media_id
+            # Filters preserve the media type (image->image, video->video).
+            current_type = current_type if step.get("kind") == "filter" else _step_output_type(step)
+            await _save_progress(db, run_id, idx, step_results, "running", current_media_id)
+            await _broadcast(websocket_manager, db, run_id, profile_id, job_instance_id)
+            log.info(
+                f"[postproc] Run {run_id} step {idx} ({_step_label(step)}) -> media {out_media_id} "
+                f"in {duration_ms}ms"
+            )
+
+        # Roll the chain's total time (base generation + every executed step)
+        # onto the final media, so its result-tile badge reflects the whole
+        # invocation rather than just the last step's own compute time.
+        steps_total_ms = sum(
+            sr.get("duration_ms", 0) for sr in step_results if sr.get("status") == "done"
+        )
+        if steps_total_ms:
+            base_time_s = await _generation_time_seconds(db, base_media_id)
+            await _apply_chain_total_generation_time(
+                db, current_media_id, base_time_s + steps_total_ms / 1000.0
+            )
+
+        # Finalize only after final-media metadata is settled. Tests and UI
+        # poll for "completed", so this status must mean the final media is
+        # ready to read.
+        async with db.async_session_maker() as session:
+            await session.execute(
+                update(PostProcessingChainRun)
+                .where(PostProcessingChainRun.id == run_id)
+                .values(
+                    status="completed",
+                    final_media_id=current_media_id,
+                    last_good_media_id=current_media_id,
+                    step_index=len(steps),
+                    step_results=json.dumps(step_results),
+                    updated_at=datetime.utcnow(),
+                )
+            )
+            await session.commit()
+
+        # The base job IS the result-strip item: point it at the chain's final
+        # output and re-broadcast it, so its tile becomes the final image (the
+        # base and intermediates stay reachable via lineage). Do this before
+        # the chain-completed broadcast so the tile never flashes the base.
+        await _finalize_base_job(db, profile_id, job_id, current_media_id, websocket_manager)
+
+        await _broadcast(websocket_manager, db, run_id, profile_id, job_instance_id)
+        log.info(f"[postproc] Run {run_id} completed; final media {current_media_id} (base {base_media_id}, job {job_id})")
+
+        _track_chain_executed("completed")
+        await _settle_pipeline_for_run(db, job_id, "completed", steps, run_created_at)
+
+    except asyncio.CancelledError:
+        # Dismissed while running — the dismiss route soft-deletes the row and
+        # emits chain_run_dismissed; here we record the cancelled outcome.
+        try:
+            _track_chain_executed("cancelled")
+            await _settle_pipeline_for_run(db, job_id, "cancelled", steps, run_created_at)
+        except Exception:
+            pass
+        raise
+
+    except Exception as e:
+        log.error(f"[postproc] Chain run {run_id} crashed: {e}", exc_info=True)
+        try:
+            async with db.async_session_maker() as session:
+                await session.execute(
+                    update(PostProcessingChainRun)
+                    .where(PostProcessingChainRun.id == run_id)
+                    .values(status="paused", error=str(e), updated_at=datetime.utcnow())
+                )
+                await session.commit()
+            await _broadcast(websocket_manager, db, run_id, profile_id, job_instance_id)
+        except Exception:
+            pass
+        try:
+            _track_chain_executed("failed")
+            await _settle_pipeline_for_run(
+                db, job_id, "failed", steps, run_created_at, error_message=str(e),
+            )
+        except Exception:
+            pass
+
+
+async def _finalize_base_job(db, profile_id: str, job_id: int, final_media_id: int, websocket_manager) -> None:
+    from database import GenerationJob
+
+    try:
+        async with db.async_session_maker() as session:
+            await session.execute(
+                update(GenerationJob)
+                .where(GenerationJob.id == job_id)
+                .values(result_media_id=final_media_id)
+            )
+            await session.commit()
+        if websocket_manager:
+            from generation_queue import get_generation_queue
+            job_dict = await get_generation_queue().get_job(job_id, profile_id=profile_id)
+            if job_dict:
+                await websocket_manager.broadcast("generation_job_completed", {
+                    "job": job_dict,
+                    "generator_instance_id": job_dict.get("generator_instance_id"),
+                })
+    except Exception as e:
+        log.warning(f"[postproc] Failed to point job {job_id} at final media {final_media_id}: {e}")
+
+
+async def _save_progress(
+    db,
+    run_id: int,
+    step_index: int,
+    step_results: List[Dict[str, Any]],
+    status: str,
+    last_good_media_id: int,
+    error: Optional[str] = None,
+) -> None:
+    async with db.async_session_maker() as session:
+        await session.execute(
+            update(PostProcessingChainRun)
+            .where(PostProcessingChainRun.id == run_id)
+            .values(
+                step_index=step_index,
+                step_results=json.dumps(step_results),
+                status=status,
+                last_good_media_id=last_good_media_id,
+                error=error,
+                updated_at=datetime.utcnow(),
+            )
+        )
+        await session.commit()
+
+
+async def _broadcast(websocket_manager, db, run_id: int, profile_id: str, job_instance_id: Optional[str]) -> None:
+    if not websocket_manager:
+        return
+    try:
+        async with db.async_session_maker() as session:
+            result = await session.execute(
+                select(PostProcessingChainRun).where(PostProcessingChainRun.id == run_id)
+            )
+            run = result.scalar_one_or_none()
+        if not run:
+            return
+        await websocket_manager.broadcast(
+            "postprocessing_chain_progress",
+            {
+                "chain_run": run.to_dict(),
+                "profile_id": profile_id,
+                "generator_instance_id": job_instance_id,
+            },
+        )
+    except Exception as e:
+        log.warning(f"[postproc] Failed to broadcast chain progress: {e}")
+
+
+async def _media_type(db, media_id: int) -> str:
+    async with db.async_session_maker() as session:
+        result = await session.execute(
+            select(MediaItem.file_format).where(MediaItem.id == media_id)
+        )
+        row = result.first()
+    fmt = (row[0] or "").lower() if row else ""
+    return "video" if fmt in _VIDEO_FORMATS else "image"
+
+
+# Task types whose output is audio — mirrors AUDIO_TASK_TYPES in the
+# frontend's taskTypeIcons.ts (routes /prompt/improve to the sound style).
+_AUDIO_TASK_TYPES = {"text-to-audio", "text-to-music", "text-to-speech", "audio-to-audio"}
+
+
+async def _apply_prompt_pipeline(
+    db,
+    prompt: str,
+    prompt_options: Optional[Dict[str, Any]],
+    tool_id: str,
+    task_type: Optional[str],
+    input_media_id: int,
+    parameters: Optional[Dict[str, Any]] = None,
+    profile_id: Optional[str] = None,
+    project_id: Optional[int] = None,
+) -> str:
+    """Run the full generate-time prompt pipeline on a chain step's prompt —
+    identical behavior to an interactive submit (prompt_pipeline.py mirrors
+    useSubmissionQueue.ts): wildcard resolution first, Enhance/Translate per
+    the step's promptOptions, final cleanup, then Ideogram JSON when
+    applicable. LLM failures propagate and fail the step like a failed tool
+    call."""
+    from prompt_pipeline import run_prompt_pipeline
+
+    model: Optional[str] = None
+    model_vendor: Optional[str] = None
+    effective_task = task_type or ""
+    schema_props: Dict[str, Any] = {}
+    try:
+        from providers.registry import ProviderRegistry
+        provider_tool = ProviderRegistry.get_instance().get_tool(tool_id)
+        if provider_tool:
+            descriptor = provider_tool[1]
+            model = descriptor.model
+            model_vendor = descriptor.model_vendor
+            effective_task = task_type or descriptor.task_type or ""
+            schema_props = (descriptor.parameter_schema or {}).get("properties", {})
+    except Exception as e:
+        log.warning(f"[postproc] Could not resolve tool descriptor for prompt pipeline ({tool_id}): {e}")
+
+    params = parameters or {}
+
+    def _dim(name: str) -> Optional[int]:
+        try:
+            v = params.get(name)
+            return int(v) if v else None
+        except (TypeError, ValueError):
+            return None
+
+    h3_task: Optional[str] = None
+    h3_duration: Optional[float] = None
+    h3_media_ids: List[Optional[int]] = []
+    h3_generate_audio = True
+    from model_family import model_family
+    if model_family(model) == "minimax-h3":
+        h3_task = "i2va" if input_media_id is not None else "t2va"
+        try:
+            raw_duration = params.get("duration")
+            h3_duration = float(raw_duration) if raw_duration is not None else None
+        except (TypeError, ValueError):
+            h3_duration = None
+        h3_media_ids = [input_media_id] if input_media_id is not None else []
+        h3_generate_audio = params.get("generate_audio") is not False
+
+    return await run_prompt_pipeline(
+        db,
+        prompt,
+        prompt_options,
+        model=model,
+        model_vendor=model_vendor,
+        is_video="video" in effective_task,
+        is_audio=effective_task in _AUDIO_TASK_TYPES,
+        # Chain steps always feed exactly one input image (or none, if the
+        # tool takes no image input at all).
+        input_image_count=1 if ("input_images" in schema_props or "input_image" in schema_props) else 0,
+        # Enables the image-aware cinematography path for i2v steps.
+        media_id=input_media_id,
+        h3_task=h3_task,
+        h3_duration=h3_duration,
+        h3_media_ids=h3_media_ids,
+        h3_generate_audio=h3_generate_audio,
+        # Ideogram JSON composes layout for the real canvas when the step sets one.
+        width=_dim("width"),
+        height=_dim("height"),
+        profile_id=profile_id,
+        project_id=project_id,
+    )
+
+
+async def _adapt_resolution_to_input(
+    db,
+    tool_id: str,
+    step: Dict[str, Any],
+    parameters: Dict[str, Any],
+    input_media_id: int,
+) -> None:
+    """Adapt the step's resolution parameters to the actual input media —
+    ToolView's reference-image behavior, applied at run time because a chain
+    step's input doesn't exist at config time.
+
+    Aspect-ratio tools follow the input unless the step pinned aspect_ratio in
+    its settings. Width/height tools follow the step's resolutionLock:
+    auto = adopt the input's dimensions, area = keep the configured pixel
+    budget but match the input's aspect, size = never touch. Steps saved
+    before resolutionLock existed pin explicitly-set dimensions and adapt
+    otherwise. Everything lands snapped to the tool's legal grid."""
+    from agent.tools.stp_utils import nearest_aspect_choice, snap_dims_to_schema
+    from providers.registry import ProviderRegistry
+
+    provider_tool = ProviderRegistry.get_instance().get_tool(tool_id)
+    if not provider_tool:
+        return
+    descriptor = provider_tool[1]
+    props = (descriptor.parameter_schema or {}).get("properties", {})
+    has_aspect = "aspect_ratio" in props
+    has_wh = "width" in props and "height" in props
+    if not has_aspect and not has_wh:
+        return
+
+    lock = step.get("resolutionLock")
+    if lock not in ("auto", "area", "size"):
+        lock = "size" if (parameters.get("width") and parameters.get("height")) else "auto"
+
+    needs_aspect = has_aspect and "aspect_ratio" not in parameters and lock != "size"
+    needs_dims = has_wh and lock != "size"
+    if not needs_aspect and not needs_dims:
+        return
+
+    async with db.async_session_maker() as session:
+        result = await session.execute(
+            select(MediaItem.width, MediaItem.height).where(MediaItem.id == input_media_id)
+        )
+        row = result.first()
+    if not row or not row[0] or not row[1]:
+        return
+    src_w, src_h = int(row[0]), int(row[1])
+
+    if needs_aspect:
+        choice = nearest_aspect_choice(props["aspect_ratio"].get("enum") or [], src_w, src_h)
+        if choice is not None:
+            parameters["aspect_ratio"] = choice
+
+    if needs_dims:
+        w, h = float(src_w), float(src_h)
+        if lock == "area":
+            base_w = parameters.get("width") or props.get("width", {}).get("default")
+            base_h = parameters.get("height") or props.get("height", {}).get("default")
+            try:
+                area = float(base_w) * float(base_h)
+            except (TypeError, ValueError):
+                area = 0.0
+            if area > 0:
+                aspect = src_w / src_h
+                h = max(1.0, round((area / aspect) ** 0.5))
+                w = max(1.0, round(h * aspect))
+        parameters["width"], parameters["height"] = snap_dims_to_schema(descriptor, w, h)
+
+
+async def _run_tool_step(
+    db,
+    step: Dict[str, Any],
+    input_media_id: int,
+    project_id: Optional[int],
+    all_steps: List[Dict[str, Any]],
+    run_id: Optional[str] = None,
+    profile_id: Optional[str] = None,
+) -> int:
+    """Execute one STP tool step via execute_call_tool (media_id → media_id)."""
+    from agent.v2.tools.call_tool import execute_call_tool
+
+    tool_id = step.get("tool_id")
+    if not tool_id:
+        raise ValueError("Tool step has no tool_id")
+
+    parameters: Dict[str, Any] = dict(step.get("settings") or {})
+    # Seed semantics match ToolView's submit path: unless the step explicitly
+    # unchecked Randomize, drop any lingering seed so every run gets a fresh
+    # one (execute_call_tool randomizes a missing seed). randomizeSeed itself
+    # is UI state, never an STP parameter.
+    if parameters.pop("randomizeSeed", True) is not False:
+        parameters.pop("seed", None)
+    parameters["input_images"] = [input_media_id]
+    # Record the chain on the step output so remixing any chained image
+    # restores the chain (lands in generation_metadata.parameters).
+    parameters["post_processing_chain"] = all_steps
+    if run_id:
+        # Telemetry only: ties this step's tool_* events to the base pipeline.
+        parameters["_run_id"] = run_id
+
+    # The stored prompt goes through the SAME generate-time pipeline as an
+    # interactive submit (wildcards first, Enhance/Translate per
+    # step.promptOptions, final cleanup, then Ideogram JSON) before any other
+    # parameter resolution. Final processing runs even with no promptOptions —
+    # a chain-step prompt must behave exactly like one typed in the editor.
+    if isinstance(parameters.get("prompt"), str) and parameters["prompt"].strip():
+        parameters["prompt"] = await _apply_prompt_pipeline(
+            db,
+            prompt=parameters["prompt"],
+            prompt_options=step.get("promptOptions"),
+            tool_id=tool_id,
+            task_type=step.get("task_type"),
+            input_media_id=input_media_id,
+            parameters=parameters,
+            profile_id=profile_id,
+            project_id=project_id,
+        )
+
+    # The input media is only known now — adapt the step's canvas to it, the
+    # same way ToolView reacts to a newly-set reference image.
+    try:
+        await _adapt_resolution_to_input(db, tool_id, step, parameters, input_media_id)
+    except Exception as e:
+        log.warning(f"[postproc] Resolution adaptation failed for {tool_id}: {e}")
+
+    # Relative upscale: the step stores scale_factor because the input isn't
+    # known at config time. Resolve it against the actual input here — same
+    # math as ToolView's picker (short edge × factor → the resolution param).
+    if "scale_factor" in parameters and "resolution" not in parameters:
+        scale = parameters.pop("scale_factor")
+        try:
+            from providers.registry import ProviderRegistry
+            provider_tool = ProviderRegistry.get_instance().get_tool(tool_id)
+            schema_props = (provider_tool[1].parameter_schema or {}).get("properties", {}) if provider_tool else {}
+            if "resolution" in schema_props:
+                async with db.async_session_maker() as session:
+                    result = await session.execute(
+                        select(MediaItem.width, MediaItem.height).where(MediaItem.id == input_media_id)
+                    )
+                    row = result.first()
+                if row and row[0] and row[1]:
+                    parameters["resolution"] = int(round(min(row[0], row[1]) * float(scale)))
+        except Exception as e:
+            log.warning(f"[postproc] Could not resolve scale_factor for {tool_id}: {e}")
+
+    async with db.async_session_maker() as session:
+        result = await execute_call_tool(
+            tool_id=tool_id,
+            parameters=parameters,
+            task_type_override=step.get("task_type"),
+            session=session,
+            project_id=project_id,
+            generator_instance_id=CHAIN_INSTANCE_ID,
+        )
+    media_id = result.get("media_id")
+    if not media_id:
+        raise RuntimeError(f"Tool step {tool_id} produced no media")
+    return media_id

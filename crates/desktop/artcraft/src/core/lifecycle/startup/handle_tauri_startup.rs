@@ -2,6 +2,7 @@ use crate::core::lifecycle::startup::tasks::bootstrap_task_database::bootstrap_t
 use crate::core::lifecycle::startup::tasks::initially_size_and_position_windows::initially_size_and_position_windows;
 use crate::core::lifecycle::startup::tasks::load_provider_priority_state::load_provider_priority_state;
 use crate::core::lifecycle::startup::tasks::set_app_log_level::set_app_log_level;
+use crate::core::lifecycle::startup::tasks::spawn_companion_supervisor::spawn_companion_supervisor;
 use crate::core::lifecycle::startup::tasks::spawn_discord_presence_thread::spawn_discord_presence_thread;
 use crate::core::lifecycle::startup::tasks::spawn_main_window_thread::spawn_main_window_thread;
 use crate::core::lifecycle::startup::tasks::spawn_sora_task_polling_thread::spawn_sora_task_polling_thread;
@@ -22,6 +23,8 @@ use crate::services::storyteller::state::storyteller_credential_manager::Storyte
 use crate::services::worldlabs::state::worldlabs_bearer_bridge::WorldlabsBearerBridge;
 use crate::services::worldlabs::state::worldlabs_credential_manager::WorldlabsCredentialManager;
 use crate::core::providers::credentials::provider_credential_loading_cache::ProviderCredentialLoadingCache;
+use crate::core::state::companion::companion_restart_signal::CompanionRestartSignal;
+use crate::core::state::companion::companion_state::CompanionState;
 use crate::core::threads::third_party_task_polling_thread::third_party_task_polling_thread::third_party_task_polling_thread;
 use crate::services::worldlabs::threads::worldlabs_marble_task_polling::worldlabs_marble_task_polling;
 use errors::AnyhowResult;
@@ -42,6 +45,8 @@ pub async fn handle_tauri_startup(
   worldlabs_bearer_bridge: WorldlabsBearerBridge,
   worldlabs_creds_manager: WorldlabsCredentialManager,
   credential_cache: ProviderCredentialLoadingCache,
+  companion_state: CompanionState,
+  companion_restart_signal: CompanionRestartSignal,
 ) -> AnyhowResult<()> {
 
   set_app_log_level(
@@ -129,6 +134,8 @@ pub async fn handle_tauri_startup(
   ));
 
   spawn_discord_presence_thread()?;
+
+  spawn_companion_supervisor(&app, &companion_state, &companion_restart_signal)?;
 
   initially_size_and_position_windows(&app, &root);
 

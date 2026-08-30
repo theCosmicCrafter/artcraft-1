@@ -23,7 +23,7 @@ use uuid::uuid;
 pub struct UploadImageFromFileArgs<'a, P: AsRef<Path>> {
   pub api_host: &'a ApiHost,
   pub maybe_creds: Option<&'a StorytellerCredentialSet>,
-  
+
   // NB: Path needs to be owned for the request.
   pub path: P,
 
@@ -38,7 +38,7 @@ pub struct UploadImageFromFileArgs<'a, P: AsRef<Path>> {
   pub maybe_generation_provider: Option<GenerationProvider>,
 
   /// If provided, this groups the file into a batch
-  /// TODO: This shouldn't be set clientside without the backend generating the token 
+  /// TODO: This shouldn't be set clientside without the backend generating the token
   ///  and cryptographically securing it. But we need to go fast here.
   pub maybe_batch_token: Option<&'a BatchGenerationToken>,
 }
@@ -47,7 +47,7 @@ pub struct UploadImageFromFileArgs<'a, P: AsRef<Path>> {
 pub async fn upload_image_media_file_from_file<P: AsRef<Path>>(
   args: UploadImageFromFileArgs<'_, P>,
 ) -> Result<UploadImageMediaFileSuccessResponse, StorytellerError> {
-  
+
   validate_args(&args)?;
 
   let url = get_route(args.api_host);
@@ -72,11 +72,11 @@ pub async fn upload_image_media_file_from_file<P: AsRef<Path>>(
   if args.is_intermediate_system_file {
     form = form.text("is_intermediate_system_file", "true");
   }
-  
+
   if let Some(prompt_token) = &args.maybe_prompt_token {
     form = form.text("maybe_prompt_token", prompt_token.to_string());
   }
-  
+
   if let Some(batch_token) = &args.maybe_batch_token {
     form = form.text("maybe_batch_token", batch_token.to_string());
   }
@@ -88,13 +88,11 @@ pub async fn upload_image_media_file_from_file<P: AsRef<Path>>(
   let mut request_builder = client.post(url)
       .header("User-Agent", USER_AGENT)
       .header("Accept", APPLICATION_JSON);
-  
+
   if let Some(creds) = args.maybe_creds {
-    if let Some(header) = &creds.maybe_as_cookie_header() {
-      request_builder = request_builder.header("Cookie", header);
-    }
+    request_builder = creds.apply_auth(request_builder);
   }
-  
+
   let response = request_builder
       .multipart(form)
       .send()

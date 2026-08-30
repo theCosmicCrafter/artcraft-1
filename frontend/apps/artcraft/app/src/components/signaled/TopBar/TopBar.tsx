@@ -41,6 +41,7 @@ import {
   GalleryViewToggle,
 } from "@storyteller/ui-generation-list";
 import { SettingsModal } from "@storyteller/ui-settings-modal";
+import { CompanionStatusIndicator } from "@storyteller/ui-medialibrary";
 import { Tooltip } from "@storyteller/ui-tooltip";
 import { useEffect, useRef, useState } from "react";
 import { APP_DESCRIPTORS, goToApp } from "~/config/appMenu";
@@ -375,6 +376,8 @@ export const TopBar = ({ pageName }: Props) => {
         return "ArtCraft";
       case "BACKGROUND_CHANGE":
         return "Background Change";
+      case "MEDIA_LIBRARY":
+        return "Media Library";
       default:
         return "Artcraft";
     }
@@ -593,6 +596,8 @@ export const TopBar = ({ pageName }: Props) => {
               )}
 
               <UploadImagesButton className="h-[34px] w-[34px]" />
+
+              <CompanionStatusIndicator className="no-drag hidden lg:flex" />
 
               <Tooltip content="Settings" position="bottom" delay={300}>
                 <Button

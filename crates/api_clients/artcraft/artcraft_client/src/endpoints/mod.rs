@@ -2,6 +2,7 @@ pub mod analytics;
 pub mod credits;
 pub mod generate;
 pub mod jobs;
+pub mod mcp_sessions;
 pub mod omni_gen;
 pub mod media_files;
 pub mod prompts;

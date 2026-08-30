@@ -1,5 +1,6 @@
 pub mod app_preferences;
 pub mod app_state;
+pub mod companion;
 pub mod cost_estimate;
 pub mod download;
 pub mod enqueue;
